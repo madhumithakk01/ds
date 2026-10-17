@@ -1,0 +1,42 @@
+# Settings for the Gotham IoT IDS pipeline.
+# Override values without editing this file:
+#   * put a config.override.yaml in the work directory on Drive, or
+#   * pass --set key=value on the command line (e.g. --set explore.block_mb=16).
+
+paths:
+  work_dir: /content/drive/MyDrive/gotham_ids     # every output and all progress state lives here
+  zip_path: /content/drive/MyDrive/GothamDataset2025.zip
+  data_dir: null              # set instead of zip_path if the CSVs are already extracted somewhere
+  search_roots: [/content/drive/MyDrive]          # searched when zip_path does not exist
+  local_tmp: /content/gids_tmp
+
+inventory:
+  include: ["processed"]      # a CSV counts as processed data when its path contains one of these
+  exclude: ["__macosx", "/raw/"]
+
+explore:
+  block_mb: 32                # bytes of CSV text parsed at a time
+  deep_every: 3               # column statistics on every n-th block; counts always use every block
+  head_files: 6               # CSVs whose first rows are profiled by `inventory`
+  head_mb: 8
+  throughput_mb: 256          # amount read to measure archive read speed
+  parser: auto                # auto | pyarrow | pandas
+  segment_backstep_s: 1.0     # time going back by more than this marks a new capture segment
+  max_gap_s: 300              # a pause longer than this also marks a new segment
+
+ingest:
+  label_column: auto          # auto-detected; set the column name if detection is wrong
+
+labels:
+  scheme: coarse              # coarse: six families; fine: every raw label is a class
+  normal_class: Normal
+  unmapped: keep              # keep unknown raw labels as their own class, or drop them
+  explicit_map: {}            # "raw label": "class" (checked before the rules)
+  drop_raw: []
+  rules:                      # regex (case-insensitive) -> class, first match wins
+    - ["normal|benign", "Normal"]
+    - ["brute", "Brute Force"]
+    - ["scan", "Network Scanning"]
+    - ["amplif|\\bdos\\b|ddos|flood", "DoS"]
+    - ["ingress|infect|download|code exec|loader", "Infection"]
+    - ["c&c|c2|command|report|periodic|beacon", "C&C Communication"]

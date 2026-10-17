@@ -1,0 +1,200 @@
+"""Command line entry point: ``python -m gids <command>``.
+
+Commands that change the work directory take a lock, write a run manifest
+and a structured event log, and stop cleanly on Ctrl-C / "stop cell" (the
+current unit finishes, progress is kept).  Running the same command again
+continues where it stopped.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+from pathlib import Path
+
+from . import __version__
+from .config import load_config
+from .state import (Deadline, GracefulStop, LockHeld, RunLock, ensure_dir, install_signal_handlers, read_json)
+from .trace import Tracer, list_manifests, read_events
+
+WRITE_CMDS = {"inventory", "explore"}
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="python -m gids", description="Gotham IoT intrusion-detection pipeline")
+    p.add_argument("--work-dir", help="folder for all outputs (default: paths.work_dir)")
+    p.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
+                   help="override a config value, e.g. --set explore.block_mb=16")
+    p.add_argument("--config", action="append", default=[], help="extra YAML file merged into the config")
+    p.add_argument("--quiet", action="store_true", help="print warnings and errors only")
+    p.add_argument("--force", action="store_true", help="take over a lock held by another session")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("env", help="hardware, storage, GPU and library report")
+    s = sub.add_parser("inventory", help="list the archive, peek at CSV headers, measure read speed")
+    s.add_argument("--max-minutes", type=float)
+    s = sub.add_parser("explore", help="scan every CSV (resumable) and write reports/explore/SUMMARY.md")
+    s.add_argument("--max-files", type=int, help="only the N smallest files (quick look)")
+    s.add_argument("--refresh-inventory", action="store_true")
+    s.add_argument("--max-minutes", type=float, help="stop cleanly after this many minutes")
+    s.add_argument("--block-mb", type=float)
+    sub.add_parser("status", help="progress of every stage and recent runs")
+    s = sub.add_parser("trace", help="show recent log events")
+    s.add_argument("--tail", type=int, default=40)
+    s.add_argument("--errors", action="store_true", help="warnings and errors only")
+    s.add_argument("--run", help="run id (default: latest)")
+    s = sub.add_parser("selftest", help="end-to-end check on a small synthetic archive (~30 s)")
+    s.add_argument("--keep", action="store_true")
+    s = sub.add_parser("unlock", help="remove the work-directory lock")
+    s.add_argument("--yes", action="store_true")
+    return p
+
+
+def _ago(ts: float) -> str:
+    s = max(0, time.time() - ts)
+    return f"{s:.0f}s" if s < 120 else (f"{s / 60:.0f} min" if s < 7200 else f"{s / 3600:.1f} h")
+
+
+def print_status(cfg) -> None:
+    work = Path(cfg["paths"]["work_dir"])
+    print(f"work dir: {work}")
+    lock = read_json(work / "state" / "lock.json")
+    if lock:
+        print(f"lock: held by '{lock.get('command')}' on {lock.get('host')} (pid {lock.get('pid')}), "
+              f"heartbeat {_ago(float(lock.get('heartbeat', 0)))} ago")
+    else:
+        print("lock: free")
+    hb = read_json(work / "state" / "heartbeat.json")
+    if hb:
+        extra = {k: v for k, v in hb.items() if k not in ("run", "command", "ts", "elapsed_s")}
+        print(f"last activity: {hb.get('ts')} run {hb.get('run')} '{hb.get('command')}' {extra}")
+    inv = read_json(work / "reports" / "explore" / "inventory.json")
+    if inv:
+        csvs = [m for m in inv["members"] if m["kind"] == "processed_csv"]
+        led = work / "data" / "explore" / "_ledger.jsonl"
+        done, failed, rows = 0, 0, 0
+        if led.exists():
+            last = {}
+            for line in led.read_text().splitlines():
+                try:
+                    r = json.loads(line)
+                    last[r["unit"]] = r
+                except (json.JSONDecodeError, KeyError):
+                    continue
+            done = sum(1 for r in last.values() if r["status"] == "done")
+            failed = sum(1 for r in last.values() if r["status"] == "failed")
+            rows = sum(int(r.get("rows", 0)) for r in last.values() if r["status"] == "done")
+        print(f"explore: inventory done ({len(csvs)} CSV files); scanned {done}/{len(csvs)} files, "
+              f"{rows:,} rows" + (f", {failed} failed" if failed else ""))
+        if (work / "reports" / "explore" / "SUMMARY.md").exists():
+            print(f"         summary: {work / 'reports' / 'explore' / 'SUMMARY.md'}")
+    else:
+        print("explore: inventory not run yet")
+    runs = list_manifests(work)[-8:]
+    if runs:
+        print("recent runs:")
+        for m in runs:
+            st = m.get("status")
+            if st == "running":
+                st = "running (or killed - no clean finish)"
+            print(f"  {m['run_id']}  {m.get('command'):10s} {st:38s} {m.get('elapsed_s', 0) / 60:6.1f} min "
+                  f"warnings={m.get('warnings', 0)} errors={m.get('errors', 0)}")
+
+
+def print_trace(cfg, args) -> None:
+    work = Path(cfg["paths"]["work_dir"])
+    ev = read_events(work, run_id=args.run)
+    if args.errors:
+        ev = [e for e in ev if e.get("level") in ("warn", "error")]
+    for e in ev[-args.tail:]:
+        line = f"{e['ts']} {e['level'].upper():5s} [{e['stage']}] {e['event']}: {e.get('msg', '')}"
+        if e.get("data"):
+            d = dict(e["data"])
+            tb = d.pop("traceback", None)
+            line += " | " + json.dumps(d, default=str)[:600]
+            if tb and args.errors:
+                line += "\n" + tb
+        print(line)
+    errs = sorted((work / "state" / "errors").glob("*.txt"))[-5:] if (work / "state" / "errors").exists() else []
+    if errs:
+        print("\nlatest error files:")
+        for f in errs:
+            print(f"  {f}")
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
+    if args.cmd == "selftest":
+        from .synth import selftest
+
+        return 0 if selftest(keep=args.keep) else 1
+    cfg = load_config(args.work_dir, args.set, args.config)
+    if getattr(args, "block_mb", None):
+        cfg.setdefault("explore", {})["block_mb"] = args.block_mb
+    work = ensure_dir(cfg["paths"]["work_dir"])
+    if args.cmd == "env":
+        from .envinfo import collect, print_report
+
+        print_report(collect(cfg))
+        return 0
+    if args.cmd == "status":
+        print_status(cfg)
+        return 0
+    if args.cmd == "trace":
+        print_trace(cfg, args)
+        return 0
+    if args.cmd == "unlock":
+        lock = RunLock(work / "state" / "lock.json")
+        print(f"current lock: {lock.info()}")
+        if args.yes:
+            (work / "state" / "lock.json").unlink(missing_ok=True)
+            print("lock removed")
+        else:
+            print("add --yes to remove it")
+        return 0
+
+    tracer = Tracer(work, args.cmd, echo_level="warn" if args.quiet else "info")
+    lock = RunLock(work / "state" / "lock.json")
+    try:
+        lock.acquire(args.cmd, force=args.force)
+    except LockHeld as exc:
+        print(f"ERROR: {exc}")
+        tracer.finish("refused")
+        return 2
+    install_signal_handlers(lambda m: tracer.warn("run", "signal", m))
+    tracer.start_monitor(lock=lock)
+    from .envinfo import collect
+
+    tracer.write_manifest(version=__version__, config={k: v for k, v in cfg.items() if k != "_meta"},
+                          overrides=cfg.get("_meta", {}), env=collect(cfg))
+    deadline = Deadline(getattr(args, "max_minutes", None))
+    status, code = "ok", 0
+    try:
+        if args.cmd == "inventory":
+            from .explore import run_inventory
+
+            run_inventory(cfg, tracer)
+        elif args.cmd == "explore":
+            from .explore import run_explore
+
+            run_explore(cfg, tracer, deadline, max_files=args.max_files,
+                        refresh_inventory=args.refresh_inventory)
+    except GracefulStop as exc:
+        status, code = "stopped", 3
+        print(f"\nStopped ({exc}). Progress is saved - run the same command again to continue.")
+    except KeyboardInterrupt:
+        status, code = "interrupted", 130
+        print("\nInterrupted. Finished units are saved - run the same command again to continue.")
+    except Exception as exc:  # noqa: BLE001
+        tracer.exception("run", "failed", exc)
+        status, code = "failed", 1
+        print(f"\nFAILED: {type(exc).__name__}: {exc}\nDetails: python -m gids trace --errors "
+              f"(log: {tracer.text})")
+    finally:
+        tracer.finish(status)
+        lock.release()
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
