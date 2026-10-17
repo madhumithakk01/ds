@@ -18,7 +18,7 @@ from .config import load_config
 from .state import (Deadline, GracefulStop, LockHeld, RunLock, ensure_dir, install_signal_handlers, read_json)
 from .trace import Tracer, list_manifests, read_events
 
-WRITE_CMDS = {"inventory", "explore", "ingest", "prepare", "train", "evaluate"}
+WRITE_CMDS = {"inventory", "explore", "ingest", "prepare", "train", "evaluate", "results"}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -49,6 +49,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--max-minutes", type=float, help="stop cleanly after this many minutes")
     s = sub.add_parser("evaluate", help="test split, unseen Mirai run, per device type, TreeSHAP (resumable)")
     s.add_argument("--max-minutes", type=float, help="stop cleanly after this many minutes")
+    sub.add_parser("results", help="RESULTS.md and figures from the saved outputs of steps 0-4 (minutes)")
     sub.add_parser("status", help="progress of every stage and recent runs")
     s = sub.add_parser("trace", help="show recent log events")
     s.add_argument("--tail", type=int, default=40)
@@ -288,6 +289,10 @@ def main(argv=None) -> int:
             from .evaluate import run_evaluate
 
             run_evaluate(cfg, tracer, deadline)
+        elif args.cmd == "results":
+            from .results import run_results
+
+            run_results(cfg, tracer)
     except GracefulStop as exc:
         status, code = "stopped", 3
         print(f"\nStopped ({exc}). Progress is saved - run the same command again to continue.")

@@ -365,6 +365,11 @@ def selftest(keep: bool = False) -> bool:
     want = float(lab["test"].sum()) if "test" in lab else -1
     checks.append(("evaluate: every test packet scored exactly once", abs(tm.get("packets", -2) - want) < 0.5,
                    f"{tm.get('packets')} vs {want}"))
+    r = subprocess.run(base + ev_args + ["results"], cwd=repo, env=env, capture_output=True, text=True)
+    res = work / "reports/results"
+    figs = sorted(p.name for p in (res / "figures").glob("*.png")) if (res / "figures").exists() else []
+    checks.append(("results: RESULTS.md and 5 figures written", r.returncode == 0 and (res / "RESULTS.md").exists()
+                   and len(figs) == 5, f"{figs} {r.stderr[-600:]}"))
     r = run(["status"])
     checks.append(("status command", r.returncode == 0 and "xgb_full" in r.stdout, r.stderr[-300:]))
     ok = all(c[1] for c in checks)

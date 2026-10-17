@@ -18,7 +18,8 @@ built to run on the free tier of Google Colab:
 | 1. Ingest | CSV -> typed Parquet parts with context features; time-blocked train/val/test split | done |
 | 2. Prepare | per-segment device IP, classes, split + episode tags, merged rows with weights, shortcut check | done |
 | 3. Train | XGBoost / LightGBM / random forest x feature sets (full, no TTL, portable), checkpoints, validation | done |
-| 4. Evaluate + explain | test split, false alarms, per device type, unseen Mirai run, TreeSHAP | **ready** |
+| 4. Evaluate + explain | test split, false alarms, per device type, unseen Mirai run, TreeSHAP | done |
+| 5. Results | RESULTS.md + figures from the saved outputs; scan + brute force merged view | **ready** |
 
 ## Run step 0 in Colab
 
@@ -86,6 +87,11 @@ Step 4 adds two experiments to `configs/experiments.yaml`: `xgb_strict` (portabl
 options fields, which partly fingerprint the sender's operating system) and `xgb_portable_mirai_holdout`
 (trained without the third Mirai run, to test recognition of an attack run the model has never seen).
 
+## Run step 5 in Colab
+
+1. Open <https://colab.research.google.com/github/madhumithakk01/ds/blob/main/notebooks/05_results.ipynb>
+2. CPU runtime, run all cells (about a minute). Cell 6 downloads the document, figures and tables as a zip.
+
 ## Commands
 
 ```
@@ -101,6 +107,7 @@ python -m gids prepare             # step 2: classes, split/episode tags, merged
 python -m gids train               # step 3: dataset + every experiment in configs/experiments.yaml (resumable)
 python -m gids train --only xgb_full,xgb_portable
 python -m gids evaluate            # step 4: test split, unseen Mirai run, per device type, TreeSHAP (resumable)
+python -m gids results             # step 5: RESULTS.md + figures from the saved outputs (re-runs nothing)
 python -m gids status              # progress, lock, recent runs (finished / killed)
 python -m gids trace --errors      # warnings and errors with tracebacks
 python -m gids unlock --yes        # remove a lock left by a dead session
@@ -138,6 +145,9 @@ reports/prepare/
   segments.csv                       device IP, share, time range and labels of every capture segment
 reports/train/
   TRAIN.md, experiments.csv          validation results of every experiment, testbed-reliance table
+reports/results/
+  RESULTS.md, figures/*.png          the write-up: summary, data, method, results, limitations, reproducibility
+  test_results.csv, test_telnet_merged_f1.csv, results.json
 reports/evaluate/
   EVALUATE.md, test_results.csv      test metrics of every model, unseen run, explanations
   test_<model>.json, unseen_run.json, explain.json, per_device_type_<model>.csv
