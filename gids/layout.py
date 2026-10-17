@@ -14,7 +14,6 @@ from .config import experiment_config, get_path
 from .state import ensure_dir, stable_hash
 
 INGEST_VERSION = 2
-FEATURIZE_VERSION = 1
 
 
 def work(cfg) -> Path:
@@ -52,49 +51,28 @@ def ingest_dir(cfg) -> Path:
     return ensure_dir(work(cfg) / "data" / f"ingest-{stable_hash(ingest_spec(cfg))}")
 
 
-def feature_list(cfg, fs: str):
-    sets = get_path(cfg, "features.sets", {}) or {}
-    if fs not in sets:
-        raise KeyError(f"Unknown feature set '{fs}'. Known: {sorted(sets)}")
-    return list(sets[fs])
+def dataset_spec(cfg) -> Dict[str, Any]:
+    """Settings that shape the sampled training/validation tables shared by all experiments."""
+    from .prepare import prepare_spec
+
+    ds = cfg.get("dataset", {})
+    return {"prepare": stable_hash(prepare_spec(cfg)), "max_rows_per_class": int(ds.get("max_rows_per_class", 2_000_000)),
+            "val_max_rows_per_class": int(ds.get("val_max_rows_per_class", 1_000_000)),
+            "merge_cross_file": bool(ds.get("merge_cross_file", True)), "seed": int(ds.get("seed", 0))}
 
 
-def compact_spec(cfg, fs: str) -> Dict[str, Any]:
-    comp = cfg.get("compact", {})
-    dedupe = fs in (comp.get("dedupe_sets") or [])
-    return {
-        "v": FEATURIZE_VERSION,
-        "ingest": stable_hash(ingest_spec(cfg)),
-        "fs": fs,
-        "features": feature_list(cfg, fs),
-        "split_key": feature_list(cfg, get_path(cfg, "features.split_key_set", "header")),
-        "split": {k: get_path(cfg, f"split.{k}") for k in ("fractions", "seed")},
-        "dedupe": dedupe,
-        "buckets": int(comp.get("buckets", 64)) if dedupe else None,
-    }
-
-
-def compact_dir(cfg, fs: str) -> Path:
-    spec = compact_spec(cfg, fs)
-    return ensure_dir(work(cfg) / "data" / f"compact-{fs}-{stable_hash(spec)}")
+def dataset_dir(cfg) -> Path:
+    return ensure_dir(work(cfg) / "data" / f"dataset-{stable_hash(dataset_spec(cfg))}")
 
 
 def experiment_spec(cfg, name: str) -> Dict[str, Any]:
     exp = experiment_config(cfg, name)
     exp_clean = {k: v for k, v in exp.items() if k not in ("enabled", "notes", "name")}
-    fs = exp.get("feature_set", "header")
-    return {
-        "exp": exp_clean,
-        "compact": stable_hash(compact_spec(cfg, fs)),
-        "labels": cfg.get("labels", {}),
-        "split_mode": get_path(cfg, "split.mode", "vector"),
-        "device_holdout": get_path(cfg, "split.device_holdout", {}),
-    }
+    model = exp_clean.get("model", "xgboost")
+    exp_clean = {k: v for k, v in exp_clean.items() if not isinstance(v, dict) or k == model}
+    return {"exp": exp_clean, "dataset": stable_hash(dataset_spec(cfg)),
+            "features": get_path(cfg, f"features.sets.{exp.get('feature_set', 'full')}")}
 
 
 def model_dir(cfg, name: str) -> Path:
     return ensure_dir(work(cfg) / "models" / f"{name}-{stable_hash(experiment_spec(cfg, name))}")
-
-
-def exp_reports(cfg, name: str) -> Path:
-    return ensure_dir(model_dir(cfg, name) / "reports")

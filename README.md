@@ -16,8 +16,8 @@ built to run on the free tier of Google Colab:
 |---|---|---|
 | 0. Explore | list the archive, profile every CSV, label/time/protocol/duplicate analysis | done |
 | 1. Ingest | CSV -> typed Parquet parts with context features; time-blocked train/val/test split | done |
-| 2. Prepare | per-segment device IP, classes, split + episode tags, merged rows with weights, shortcut check | **ready** |
-| 3. Train | imbalance-aware XGBoost / Random Forest with checkpoints | after step 2 |
+| 2. Prepare | per-segment device IP, classes, split + episode tags, merged rows with weights, shortcut check | done |
+| 3. Train | XGBoost / LightGBM / random forest x feature sets (full, no TTL, portable), checkpoints, validation | **ready** |
 | 4. Evaluate + explain | per-class metrics, confusion, SHAP, dashboard tables | after step 3 |
 
 ## Run step 0 in Colab
@@ -64,6 +64,18 @@ What step 1 decides (agreed after step 0):
 Step 1 showed that some "-1" files (`combined-cycle-1`, `cooler-motor-1`, `predictive-maintenance-1`, ...)
 are several captures joined end to end, so step 2 finds the device IP per capture segment, not per file.
 
+## Run step 3 in Colab
+
+1. Open <https://colab.research.google.com/github/madhumithakk01/ds/blob/main/notebooks/03_train.ipynb>
+2. Runtime -> **T4 GPU** if available (CPU also works, slower). Run all cells.
+3. After a disconnect run cells 1, 2 and 4 again: finished experiments are skipped, the running one resumes
+   from its last checkpoint.
+4. Copy the text printed by cell 6 (`TRAIN.md`) into the chat.
+
+Step 2 showed that a single tree already reaches ~0.98 macro-F1, and that TTL and raw port numbers partly
+identify testbed machines and streams. Step 3 therefore trains the same models on three feature sets and
+reports how much validation macro-F1 changes without them (`TRAIN.md`, section 2).
+
 ## Commands
 
 ```
@@ -76,6 +88,8 @@ python -m gids explore --max-minutes 60     # stop cleanly after an hour
 python -m gids ingest              # step 1: CSV -> Parquet + context features, then the split (resumable)
 python -m gids ingest --max-files 5         # quick look at the five smallest files
 python -m gids prepare             # step 2: classes, split/episode tags, merged rows, shortcut check (resumable)
+python -m gids train               # step 3: dataset + every experiment in configs/experiments.yaml (resumable)
+python -m gids train --only xgb_full,xgb_portable
 python -m gids status              # progress, lock, recent runs (finished / killed)
 python -m gids trace --errors      # warnings and errors with tracebacks
 python -m gids unlock --yes        # remove a lock left by a dead session
@@ -111,11 +125,16 @@ reports/prepare/
   PREPARE.md, summary.json           rows per class/split, shortcut check, value tables, segments
   shortcut_check.csv, values_*.csv, medians_by_class.csv, rows_by_class.csv, rows_by_label.csv,
   segments.csv                       device IP, share, time range and labels of every capture segment
+reports/train/
+  TRAIN.md, experiments.csv          validation results of every experiment, testbed-reliance table
 data/explore/                        per-file scan results + progress ledger
 data/ingest-<hash>/                  Parquet parts (one or more per CSV), per-file metadata,
                                      split-<hash>.json, _state/ checkpoints of half-done files
 data/prepare-<hash>/rows/            one Parquet table per CSV: features, split, cls, label, episode,
                                      weight (identical packets merged), device_type; vocab.json
+data/dataset-<hash>/                 train.parquet / val.parquet sampled for training, dataset.json
+models/<experiment>-<hash>/          model.bin, state.json (checkpoint), metrics.json, per_class.csv,
+                                     confusion.csv, importance.csv
 logs/<run>.jsonl, logs/<run>.log     every event of every run
 runs/<run>/manifest.json             command, config, code commit, environment, final status
 state/                               lock, heartbeat, error tracebacks
@@ -133,7 +152,7 @@ time; a lock from a dead session is taken over automatically after 5 minutes.
 
 ## Configuration
 
-Defaults are in `configs/default.yaml`.  Output folders are named after a hash of the settings
+Defaults are in `configs/default.yaml`; what step 3 trains is in `configs/experiments.yaml`.  Output folders are named after a hash of the settings
 that shaped them (`data/ingest-<hash>`), so changing a setting never mixes old and new results.  To change settings without editing
 the repository, create `config.override.yaml` in the work directory on Drive,
 or pass `--set` on the command line.

@@ -1,0 +1,75 @@
+# Step 3: what is trained.  `python -m gids train` runs every enabled experiment in this order,
+# skipping the ones that are finished.  Change values here or with --set (e.g.
+# --set train_defaults.xgboost.n_estimators=300); a changed experiment trains into a new folder.
+
+dataset:                        # sampled tables shared by all experiments (data/dataset-<hash>/)
+  max_rows_per_class: 1000000   # training rows per class (unique rows, random sample of the big classes)
+  val_max_rows_per_class: 500000
+  merge_cross_file: true        # rows that are identical in two files (same capture stored twice) count once
+  seed: 0
+
+features:
+  sets:
+    full: [frame_len, ip_flags, ip_ttl, ip_proto, tcp_srcport, tcp_dstport, tcp_flags, tcp_window_size_value,
+           tcp_window_size_scalefactor, tcp_pdu_size, udp_srcport, udp_dstport, tcp_options_len,
+           tcp_options_kinds, proto_layers, proto_gre, dir_out, dir_in, ctx_all_pkts_1s, ctx_src_pkts_1s,
+           ctx_src_pkts_10s, ctx_src_bytes_1s, ctx_dst_pkts_1s, ctx_pair_pkts_1s, ctx_pair_iat,
+           ctx_flow_pkts_10s, ctx_flow_iat, ctx_src_new_dports_10s]
+    no_ttl: [frame_len, ip_flags, ip_proto, tcp_srcport, tcp_dstport, tcp_flags, tcp_window_size_value,
+             tcp_window_size_scalefactor, tcp_pdu_size, udp_srcport, udp_dstport, tcp_options_len,
+             tcp_options_kinds, proto_layers, proto_gre, dir_out, dir_in, ctx_all_pkts_1s, ctx_src_pkts_1s,
+             ctx_src_pkts_10s, ctx_src_bytes_1s, ctx_dst_pkts_1s, ctx_pair_pkts_1s, ctx_pair_iat,
+             ctx_flow_pkts_10s, ctx_flow_iat, ctx_src_new_dports_10s]
+    # no TTL and no raw port numbers: ports become their range (well-known / registered / dynamic)
+    # and the standard service they belong to, if any (see gids/train.py: SERVICES)
+    portable: [frame_len, ip_flags, ip_proto, sport_class, dport_class, sport_service, dport_service, tcp_flags,
+               tcp_window_size_value, tcp_window_size_scalefactor, tcp_pdu_size, tcp_options_len,
+               tcp_options_kinds, proto_layers, proto_gre, dir_out, dir_in, ctx_all_pkts_1s, ctx_src_pkts_1s,
+               ctx_src_pkts_10s, ctx_src_bytes_1s, ctx_dst_pkts_1s, ctx_pair_pkts_1s, ctx_pair_iat,
+               ctx_flow_pkts_10s, ctx_flow_iat, ctx_src_new_dports_10s]
+
+train_defaults:
+  model: xgboost
+  feature_set: full
+  label_scheme: coarse          # coarse: six classes | fine: every raw label that is kept
+  xgboost:
+    n_estimators: 600
+    learning_rate: 0.1
+    max_depth: 10
+    min_child_weight: 1
+    subsample: 0.8
+    colsample_bytree: 0.8
+    max_bin: 256
+    early_stopping_rounds: 40   # stop when validation loss has not improved for this many rounds
+    checkpoint_every: 25        # rounds between checkpoints on Drive
+    device: auto                # auto: GPU when the runtime has one, else CPU | cpu | cuda
+    seed: 0
+  lightgbm:
+    n_estimators: 600
+    learning_rate: 0.1
+    num_leaves: 255
+    min_child_samples: 20
+    subsample: 0.8
+    colsample_bytree: 0.8
+    max_bin: 255
+    early_stopping_rounds: 40
+    checkpoint_every: 25
+    seed: 0
+  random_forest:
+    n_estimators: 60
+    max_depth: 25
+    min_samples_leaf: 10
+    max_features: sqrt
+    max_samples: 0.1            # share of the training rows drawn for each tree
+    batch: 10                   # trees between checkpoints
+    seed: 0
+
+experiments:                    # run in this order
+  xgb_full: {model: xgboost, feature_set: full}
+  xgb_portable: {model: xgboost, feature_set: portable}
+  xgb_no_ttl: {model: xgboost, feature_set: no_ttl}
+  lgbm_full: {model: lightgbm, feature_set: full}
+  lgbm_portable: {model: lightgbm, feature_set: portable}
+  rf_portable: {model: random_forest, feature_set: portable}
+  xgb_portable_fine: {model: xgboost, feature_set: portable, label_scheme: fine,
+                      xgboost: {n_estimators: 300}}   # 17 classes: every round builds 17 trees

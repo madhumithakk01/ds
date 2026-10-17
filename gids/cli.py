@@ -18,7 +18,7 @@ from .config import load_config
 from .state import (Deadline, GracefulStop, LockHeld, RunLock, ensure_dir, install_signal_handlers, read_json)
 from .trace import Tracer, list_manifests, read_events
 
-WRITE_CMDS = {"inventory", "explore", "ingest", "prepare"}
+WRITE_CMDS = {"inventory", "explore", "ingest", "prepare", "train"}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -43,6 +43,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--max-minutes", type=float, help="stop cleanly after this many minutes")
     s = sub.add_parser("prepare", help="labels, split, per-segment direction, merged rows, checks (resumable)")
     s.add_argument("--max-files", type=int, help="only the N smallest files (quick look)")
+    s.add_argument("--max-minutes", type=float, help="stop cleanly after this many minutes")
+    s = sub.add_parser("train", help="build the dataset, train every experiment, compare on validation (resumable)")
+    s.add_argument("--only", help="comma-separated experiment names (default: all enabled, in order)")
     s.add_argument("--max-minutes", type=float, help="stop cleanly after this many minutes")
     sub.add_parser("status", help="progress of every stage and recent runs")
     s = sub.add_parser("trace", help="show recent log events")
@@ -139,6 +142,37 @@ def print_status(cfg) -> None:
             print(f"         report: {work / 'reports' / 'prepare' / 'PREPARE.md'}")
     else:
         print("prepare: not run yet")
+    try:
+        from .config import experiment_names
+        from .layout import experiment_spec
+        from .state import stable_hash
+
+        def model_dir_name(cfg, n):  # same name as layout.model_dir, without creating the folder
+            return f"{n}-{stable_hash(experiment_spec(cfg, n))}"
+
+        names = experiment_names(cfg)
+        dirs = {}
+        for n in names:  # the folder for the current settings, else the latest one trained with other settings
+            cur = work / "models" / model_dir_name(cfg, n)
+            others = sorted((work / "models").glob(f"{n}-*"), key=lambda p: p.stat().st_mtime) \
+                if (work / "models").exists() else []
+            dirs[n] = (cur, "") if (cur / "state.json").exists() else \
+                ((others[-1], " (other settings)") if others else (None, ""))
+        states = {n: read_json(d / "state.json") if d else None for n, (d, _) in dirs.items()}
+        if any(states.values()):
+            print("train:")
+            for n, st in states.items():
+                d, note = dirs[n]
+                m = read_json(d / "metrics.json") if st else None
+                txt = (f"done, validation macro-F1 {m['macro_f1']:.4f}" if m and st.get("status") == "done"
+                       else f"{st['iterations']} rounds so far" if st else "not started")
+                print(f"  {n:22s} {txt}{note}")
+            if (work / "reports" / "train" / "TRAIN.md").exists():
+                print(f"  report: {work / 'reports' / 'train' / 'TRAIN.md'}")
+        else:
+            print("train: not run yet")
+    except Exception as exc:  # noqa: BLE001 - status must never fail
+        print(f"train: (status unavailable: {exc})")
     runs = list_manifests(work)[-8:]
     if runs:
         print("recent runs:")
@@ -236,6 +270,10 @@ def main(argv=None) -> int:
             from .prepare import run_prepare
 
             run_prepare(cfg, tracer, deadline, max_files=args.max_files)
+        elif args.cmd == "train":
+            from .train import run_train
+
+            run_train(cfg, tracer, deadline, only=[x.strip() for x in args.only.split(",")] if args.only else None)
     except GracefulStop as exc:
         status, code = "stopped", 3
         print(f"\nStopped ({exc}). Progress is saved - run the same command again to continue.")

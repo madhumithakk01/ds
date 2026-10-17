@@ -214,6 +214,26 @@ def _same_prepare(a: Path, b: Path) -> Tuple[bool, str]:
     return True, ""
 
 
+def _same_model(a: Path, b: Path, name: str) -> Tuple[bool, str]:
+    import pandas as pd
+    import xgboost as xgb
+
+    def load(work: Path):
+        d = next((work / "models").glob(f"{name}-*"))
+        ds = next((work / "data").glob("dataset-*"))
+        return xgb.Booster(model_file=str(d / "model.bin")), json.loads((d / "metrics.json").read_text()), ds
+
+    (ma, ja, ds), (mb, jb, _) = load(a), load(b)
+    va = pd.read_parquet(ds / "val.parquet")
+    X = xgb.DMatrix(va[ja["features"]].to_numpy("float32"))
+    pa_, pb_ = ma.predict(X), mb.predict(X)
+    if ma.num_boosted_rounds() != mb.num_boosted_rounds():
+        return False, f"rounds {ma.num_boosted_rounds()} vs {mb.num_boosted_rounds()}"
+    if not np.array_equal(pa_, pb_):
+        return False, f"max prediction difference {np.abs(pa_ - pb_).max()}"
+    return ja["confusion"] == jb["confusion"], "confusion matrices differ"
+
+
 def selftest(keep: bool = False) -> bool:
     repo = Path(__file__).resolve().parents[1]
     tmp = Path(tempfile.mkdtemp(prefix="gids_selftest_"))
@@ -295,8 +315,28 @@ def selftest(keep: bool = False) -> bool:
                        capture_output=True, text=True)
     same, why = _same_prepare(work, ref) if r.returncode == 0 else (False, r.stderr[-600:])
     checks.append(("prepare: resumed output identical to an uninterrupted run", same, why))
+    tr_args = ["--set", "train_defaults.xgboost.n_estimators=30", "--set", "train_defaults.xgboost.checkpoint_every=5",
+               "--set", "train_defaults.xgboost.subsample=1", "--set", "train_defaults.xgboost.colsample_bytree=1",
+               "--set", "train_defaults.xgboost.device=cpu",
+               "--set", "train_defaults.lightgbm.n_estimators=15", "--set", "train_defaults.random_forest.n_estimators=6",
+               "--set", "train_defaults.random_forest.batch=3"]
+    r = subprocess.run(base + tr_args + ["train"], cwd=repo, env=dict(env, GIDS_CRASH_AFTER="train_ckpt:3"),
+                       capture_output=True, text=True)
+    checks.append(("train: simulated crash in the middle of training", r.returncode == 17,
+                   f"exit code {r.returncode} {r.stderr[-400:]}"))
+    r = subprocess.run(base + tr_args + ["train"], cwd=repo, env=env, capture_output=True, text=True)
+    logs = "".join(p.read_text() for p in (work / "logs").glob("*.jsonl"))
+    n_models = len(list((work / "models").glob("*/metrics.json")))
+    checks.append(("train resumes and finishes every experiment", r.returncode == 0 and
+                   "continuing after round 15" in logs and n_models == 7,
+                   f"exit {r.returncode}, {n_models} models; {r.stderr[-600:]}"))
+    checks.append(("train: report written", (work / "reports/train/TRAIN.md").exists(), ""))
+    r = subprocess.run([a if a != str(work) else str(ref) for a in base] + tr_args + ["train", "--only", "xgb_full"],
+                       cwd=repo, env=env, capture_output=True, text=True)
+    same, why = _same_model(work, ref, "xgb_full") if r.returncode == 0 else (False, r.stderr[-600:])
+    checks.append(("train: resumed model predicts exactly like an uninterrupted one", same, why))
     r = run(["status"])
-    checks.append(("status command", r.returncode == 0 and "prepare:" in r.stdout, r.stderr[-300:]))
+    checks.append(("status command", r.returncode == 0 and "xgb_full" in r.stdout, r.stderr[-300:]))
     ok = all(c[1] for c in checks)
     for name, passed, detail in checks:
         print(f"  [{'PASS' if passed else 'FAIL'}] {name}" + ("" if passed else f"  -> {detail}"))

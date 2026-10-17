@@ -5,3 +5,6 @@ pyyaml
 psutil
 matplotlib
 scikit-learn
+xgboost
+lightgbm
+joblib
