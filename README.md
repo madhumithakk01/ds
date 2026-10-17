@@ -17,8 +17,8 @@ built to run on the free tier of Google Colab:
 | 0. Explore | list the archive, profile every CSV, label/time/protocol/duplicate analysis | done |
 | 1. Ingest | CSV -> typed Parquet parts with context features; time-blocked train/val/test split | done |
 | 2. Prepare | per-segment device IP, classes, split + episode tags, merged rows with weights, shortcut check | done |
-| 3. Train | XGBoost / LightGBM / random forest x feature sets (full, no TTL, portable), checkpoints, validation | **ready** |
-| 4. Evaluate + explain | per-class metrics, confusion, SHAP, dashboard tables | after step 3 |
+| 3. Train | XGBoost / LightGBM / random forest x feature sets (full, no TTL, portable), checkpoints, validation | done |
+| 4. Evaluate + explain | test split, false alarms, per device type, unseen Mirai run, TreeSHAP | **ready** |
 
 ## Run step 0 in Colab
 
@@ -76,6 +76,16 @@ Step 2 showed that a single tree already reaches ~0.98 macro-F1, and that TTL an
 identify testbed machines and streams. Step 3 therefore trains the same models on three feature sets and
 reports how much validation macro-F1 changes without them (`TRAIN.md`, section 2).
 
+## Run step 4 in Colab
+
+1. Open <https://colab.research.google.com/github/madhumithakk01/ds/blob/main/notebooks/04_evaluate.ipynb>
+2. T4 GPU if available, run all cells (about 45-60 min). After a disconnect run cells 1, 2 and 4 again.
+3. Copy the text printed by cell 6 (`EVALUATE.md`) into the chat.
+
+Step 4 adds two experiments to `configs/experiments.yaml`: `xgb_strict` (portable without the TCP window and
+options fields, which partly fingerprint the sender's operating system) and `xgb_portable_mirai_holdout`
+(trained without the third Mirai run, to test recognition of an attack run the model has never seen).
+
 ## Commands
 
 ```
@@ -90,6 +100,7 @@ python -m gids ingest --max-files 5         # quick look at the five smallest fi
 python -m gids prepare             # step 2: classes, split/episode tags, merged rows, shortcut check (resumable)
 python -m gids train               # step 3: dataset + every experiment in configs/experiments.yaml (resumable)
 python -m gids train --only xgb_full,xgb_portable
+python -m gids evaluate            # step 4: test split, unseen Mirai run, per device type, TreeSHAP (resumable)
 python -m gids status              # progress, lock, recent runs (finished / killed)
 python -m gids trace --errors      # warnings and errors with tracebacks
 python -m gids unlock --yes        # remove a lock left by a dead session
@@ -127,12 +138,16 @@ reports/prepare/
   segments.csv                       device IP, share, time range and labels of every capture segment
 reports/train/
   TRAIN.md, experiments.csv          validation results of every experiment, testbed-reliance table
+reports/evaluate/
+  EVALUATE.md, test_results.csv      test metrics of every model, unseen run, explanations
+  test_<model>.json, unseen_run.json, explain.json, per_device_type_<model>.csv
 data/explore/                        per-file scan results + progress ledger
 data/ingest-<hash>/                  Parquet parts (one or more per CSV), per-file metadata,
                                      split-<hash>.json, _state/ checkpoints of half-done files
 data/prepare-<hash>/rows/            one Parquet table per CSV: features, split, cls, label, episode,
                                      weight (identical packets merged), device_type; vocab.json
-data/dataset-<hash>/                 train.parquet / val.parquet sampled for training, dataset.json
+data/dataset-<hash>/                 train.parquet / val.parquet sampled for training, dataset.json,
+                                     test.parquet (every test row, read only by step 4)
 models/<experiment>-<hash>/          model.bin, state.json (checkpoint), metrics.json, per_class.csv,
                                      confusion.csv, importance.csv
 logs/<run>.jsonl, logs/<run>.log     every event of every run

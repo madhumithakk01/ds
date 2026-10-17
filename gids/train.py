@@ -22,6 +22,7 @@ order (XGBoost, LightGBM, random forest x feature sets x label schemes):
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -111,6 +112,43 @@ def _rows_path(pdir: Path, info: Dict[str, Any]) -> Path:
     return pdir / "rows" / f"{stable_hash(info['id'], 16)}.parquet"
 
 
+def cross_file_merge(h: np.ndarray, f: np.ndarray, w: np.ndarray, infos: List[Dict[str, Any]], enabled: bool = True):
+    """Rows with the same hash in several files (one capture stored twice) are kept once, in the first file.
+
+    Returns (keep mask, weights with the dropped copies added to the kept row, dropped rows, dropped packets,
+    {"file <- copy file": rows} for the ten most frequent pairs).
+    """
+    keep = np.ones(len(h), dtype=bool)
+    wsum = w.astype(np.float64)
+    if not enabled or not len(h):
+        return keep, wsum, 0, 0, {}
+    order = np.lexsort((f, h))
+    hs_ = h[order]
+    starts = np.flatnonzero(np.r_[True, hs_[1:] != hs_[:-1]])
+    sizes = np.diff(np.r_[starts, len(h)])
+    if not (sizes > 1).any():
+        return keep, wsum, 0, 0, {}
+    grp = np.repeat(np.arange(len(starts)), sizes)
+    first = order[starts][grp]
+    later = np.r_[False, grp[1:] == grp[:-1]]
+    dropped = order[later]
+    keep[dropped] = False
+    np.add.at(wsum, first[later], w[dropped])
+    pf = pd.Series(list(zip(f[first[later]], f[dropped]))).value_counts()
+    pairs = {f"{Path(infos[a]['member']).name} <- {Path(infos[b]['member']).name}": int(v)
+             for (a, b), v in pf.head(10).items()}
+    return keep, wsum, int(len(dropped)), int(w[dropped].sum()), pairs
+
+
+def held_out_mask(df: pd.DataFrame, labels: List[str], hold: Optional[Dict[str, Any]]) -> np.ndarray:
+    """True for rows of a held-out run: raw label matching ``hold['label_regex']`` and episode ``hold['episode']``."""
+    if not hold or not len(df):
+        return np.zeros(len(df), dtype=bool)
+    rx = re.compile(hold["label_regex"])
+    held = np.array([bool(rx.search(lab)) for lab in labels])
+    return held[df["label"].to_numpy(np.int64)] & (df["episode"].to_numpy(np.int64) == int(hold["episode"]))
+
+
 def build_dataset(cfg, tracer, deadline: Deadline) -> Dict[str, Any]:
     ddir = layout.dataset_dir(cfg)
     meta = read_json(ddir / "dataset.json")
@@ -138,25 +176,7 @@ def build_dataset(cfg, tracer, deadline: Deadline) -> Dict[str, Any]:
             tracer.progress(STAGE, fi + 1, len(infos), "files (dataset pass 1)", every_s=30)
     h, f, r, s, c, w = (np.concatenate(x) for x in (hs, fs, rs, ss, cs, ws))
     del hs, fs, rs, ss, cs, ws
-    keep = np.ones(len(h), dtype=bool)
-    wsum = w.astype(np.float64)
-    dup_rows, dup_packets, pairs = 0, 0, {}
-    if spec["merge_cross_file"] and len(h):
-        order = np.lexsort((f, h))
-        hs_ = h[order]
-        starts = np.flatnonzero(np.r_[True, hs_[1:] != hs_[:-1]])
-        sizes = np.diff(np.r_[starts, len(h)])
-        multi = starts[sizes > 1]
-        if len(multi):
-            grp = np.repeat(np.arange(len(starts)), sizes)
-            first = order[starts][grp]
-            dropped = order[np.r_[False, grp[1:] == grp[:-1]]]
-            keep[dropped] = False
-            np.add.at(wsum, first[np.r_[False, grp[1:] == grp[:-1]]], w[dropped])
-            dup_rows, dup_packets = int(len(dropped)), int(w[dropped].sum())
-            pf = pd.Series(list(zip(f[first[np.r_[False, grp[1:] == grp[:-1]]]], f[dropped]))).value_counts()
-            pairs = {f"{Path(infos[a]['member']).name} <- {Path(infos[b]['member']).name}": int(v)
-                     for (a, b), v in pf.head(10).items()}
+    keep, wsum, dup_rows, dup_packets, pairs = cross_file_merge(h, f, w, infos, spec["merge_cross_file"])
     caps = {0: spec["max_rows_per_class"], 1: spec["val_max_rows_per_class"]}
     counts = {(int(sp), int(cl)): int(n) for (sp, cl), n in
               pd.Series(keep).groupby([s, c]).sum().items()}
@@ -368,6 +388,48 @@ def fit_random_forest(p: Dict[str, Any], X, y, w, Xv, yv, wv, n_cls: int, mdir: 
 FITTERS = {"xgboost": fit_xgboost, "lightgbm": fit_lightgbm, "random_forest": fit_random_forest}
 
 
+def load_model(cfg, name: str, ds: Dict[str, Any]) -> Dict[str, Any]:
+    """A finished experiment ready to predict: classes, feature names and predict(df) -> probabilities."""
+    exp = experiment_config(cfg, name)
+    mdir = layout.model_dir(cfg, name)
+    st = read_json(mdir / "state.json") or {}
+    if st.get("status") != "done" or not output_ok(mdir / "model.bin"):
+        raise RuntimeError(f"Experiment {name} is not trained yet (run `python -m gids train --only {name}`)")
+    model = exp.get("model", "xgboost")
+    names = list(get_path(cfg, f"features.sets.{exp.get('feature_set', 'full')}"))
+    classes, lut = label_space({k: ds[k] for k in ("classes", "labels", "label_class")},
+                               exp.get("label_scheme", "coarse"))
+    best = int(st["best_iter"])
+    if model == "xgboost":
+        import xgboost as xgb
+
+        bst = xgb.Booster(model_file=str(mdir / "model.bin"))
+        bst.set_param({"device": "cpu"})
+        raw = lambda X: bst.inplace_predict(X, iteration_range=(0, best))
+    elif model == "lightgbm":
+        import lightgbm as lgb
+
+        bst = lgb.Booster(model_file=str(mdir / "model.bin"))
+        raw = lambda X: bst.predict(X, num_iteration=best)
+    else:
+        import joblib
+
+        bst = joblib.load(mdir / "model.bin")
+
+        def raw(X):
+            full = np.zeros((len(X), len(classes)))
+            full[:, bst.classes_] = bst.predict_proba(np.nan_to_num(X, nan=-1.0))
+            return full
+
+    def predict(df: pd.DataFrame, chunk: int = 1_000_000) -> np.ndarray:
+        return np.concatenate([np.asarray(raw(make_matrix(df.iloc[i:i + chunk], names)))
+                               for i in range(0, len(df), chunk)]) if len(df) else np.zeros((0, len(classes)))
+
+    return {"name": name, "model": model, "booster": bst, "best": best, "features": names, "classes": classes,
+            "lut": lut, "scheme": exp.get("label_scheme", "coarse"), "feature_set": exp.get("feature_set"),
+            "holdout": exp.get("holdout"), "predict": predict, "dir": mdir}
+
+
 # =====================================================================
 # evaluation
 
@@ -431,6 +493,10 @@ def run_experiment(cfg, name: str, ds: Dict[str, Any], tracer, deadline: Deadlin
     voc = {k: ds[k] for k in ("classes", "labels", "label_class")}
     classes, lut = label_space(voc, scheme)
     tr, va = cache["train"], cache["val"]
+    hold = exp.get("holdout")
+    if hold:  # e.g. the third Mirai run: left out of training and early stopping, tested in step 4
+        tr = tr[~held_out_mask(tr, ds["labels"], hold)]
+        va = va[~held_out_mask(va, ds["labels"], hold)]
     y = lut[tr["label"].to_numpy(np.int64)]
     yv = lut[va["label"].to_numpy(np.int64)]
     X, Xv = make_matrix(tr, names), make_matrix(va, names)
@@ -453,6 +519,7 @@ def run_experiment(cfg, name: str, ds: Dict[str, Any], tracer, deadline: Deadlin
     imp_s = (imp_s / imp_s.sum()).sort_values(ascending=False) if imp_s.sum() else imp_s
     st = prog.state
     m.update({"name": name, "model": model, "feature_set": fs, "label_scheme": scheme, "features": names,
+              "holdout": hold,
               "iterations": st["iterations"], "best_iter": st["best_iter"], "minutes": round(st["seconds"] / 60, 1),
               "importance": imp_s.head(15).to_dict(), "train_rows": int(len(y)), "val_rows": int(len(yv)),
               "dir": str(mdir)})
@@ -524,14 +591,15 @@ def write_report(cfg, ds: Dict[str, Any]) -> None:
          "## 1. Experiments", "",
          "For `fine` experiments the F1 columns are the six coarse classes, read from the fine predictions.", "",
          md_table(table.round(4), max_rows=40), ""]
-    by = {(m["model"], m["feature_set"], m["label_scheme"]): m for m in done}
+    by = {(m["model"], m["feature_set"], m["label_scheme"]): m for m in done if not m.get("holdout")}
     rel = []
     for model in ("xgboost", "lightgbm", "random_forest"):
         full = by.get((model, "full", "coarse"))
-        for fs in ("no_ttl", "portable"):
+        for fs, without in (("no_ttl", "TTL"), ("portable", "TTL + raw ports"),
+                            ("strict", "TTL + raw ports + TCP window/options")):
             o = by.get((model, fs, "coarse"))
             if full and o:
-                r = {"model": model, "without": "TTL" if fs == "no_ttl" else "TTL + raw ports",
+                r = {"model": model, "without": without,
                      "macro_f1 full": full["macro_f1"], "macro_f1 without": o["macro_f1"],
                      "change": o["macro_f1"] - full["macro_f1"]}
                 for a, b in zip(full["per_class"], o["per_class"]):

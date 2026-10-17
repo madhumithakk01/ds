@@ -192,6 +192,18 @@ def _same_ingest(a: Path, b: Path, truth: Dict) -> Tuple[bool, str]:
     return True, ""
 
 
+def experiment_names(cfg):
+    from .config import experiment_names as names
+
+    return names(cfg)
+
+
+def load_config(work_dir: str):
+    from .config import load_config as load
+
+    return load(work_dir)
+
+
 def _read_csv(path: Path):
     import pandas as pd
 
@@ -328,13 +340,31 @@ def selftest(keep: bool = False) -> bool:
     logs = "".join(p.read_text() for p in (work / "logs").glob("*.jsonl"))
     n_models = len(list((work / "models").glob("*/metrics.json")))
     checks.append(("train resumes and finishes every experiment", r.returncode == 0 and
-                   "continuing after round 15" in logs and n_models == 7,
+                   "continuing after round 15" in logs and n_models == len(experiment_names(load_config(str(work)))),
                    f"exit {r.returncode}, {n_models} models; {r.stderr[-600:]}"))
     checks.append(("train: report written", (work / "reports/train/TRAIN.md").exists(), ""))
     r = subprocess.run([a if a != str(work) else str(ref) for a in base] + tr_args + ["train", "--only", "xgb_full"],
                        cwd=repo, env=env, capture_output=True, text=True)
     same, why = _same_model(work, ref, "xgb_full") if r.returncode == 0 else (False, r.stderr[-600:])
     checks.append(("train: resumed model predicts exactly like an uninterrupted one", same, why))
+    ev_args = tr_args + ["--set", "experiments.xgb_portable_mirai_holdout.holdout.label_regex=^DoS",
+                         "--set", "experiments.xgb_portable_mirai_holdout.holdout.episode=0",
+                         "--set", "evaluate.shap_rows_per_class=200"]
+    r = subprocess.run(base + ev_args + ["evaluate"], cwd=repo, env=dict(env, GIDS_CRASH_AFTER="evaluate:2"),
+                       capture_output=True, text=True)
+    checks.append(("evaluate: simulated crash after two models", r.returncode == 17,
+                   f"exit code {r.returncode} {r.stderr[-400:]}"))
+    r = subprocess.run(base + ev_args + ["evaluate"], cwd=repo, env=env, capture_output=True, text=True)
+    ev = work / "reports/evaluate"
+    checks.append(("evaluate resumes and writes the report", r.returncode == 0 and (ev / "EVALUATE.md").exists()
+                   and (ev / "unseen_run.json").exists() and (ev / "explain.json").exists()
+                   and len(list(ev.glob("test_*.json"))) == 5, r.stderr[-800:] or r.stdout[-400:]))
+    tm = json.loads(next((work / "data").glob("dataset-*/test.json")).read_text()) if \
+        list((work / "data").glob("dataset-*/test.json")) else {}
+    lab = _read_csv(work / "reports/prepare/rows_by_label.csv")
+    want = float(lab["test"].sum()) if "test" in lab else -1
+    checks.append(("evaluate: every test packet scored exactly once", abs(tm.get("packets", -2) - want) < 0.5,
+                   f"{tm.get('packets')} vs {want}"))
     r = run(["status"])
     checks.append(("status command", r.returncode == 0 and "xgb_full" in r.stdout, r.stderr[-300:]))
     ok = all(c[1] for c in checks)

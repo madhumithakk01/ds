@@ -27,6 +27,12 @@ features:
                tcp_options_kinds, proto_layers, proto_gre, dir_out, dir_in, ctx_all_pkts_1s, ctx_src_pkts_1s,
                ctx_src_pkts_10s, ctx_src_bytes_1s, ctx_dst_pkts_1s, ctx_pair_pkts_1s, ctx_pair_iat,
                ctx_flow_pkts_10s, ctx_flow_iat, ctx_src_new_dports_10s]
+    # portable without the fields that also fingerprint the sender's operating system
+    # (TCP window size and scale factor, TCP options): only rates, flows, sizes, flags and protocol
+    strict: [frame_len, ip_flags, ip_proto, sport_class, dport_class, sport_service, dport_service, tcp_flags,
+             tcp_pdu_size, proto_layers, proto_gre, dir_out, dir_in, ctx_all_pkts_1s, ctx_src_pkts_1s,
+             ctx_src_pkts_10s, ctx_src_bytes_1s, ctx_dst_pkts_1s, ctx_pair_pkts_1s, ctx_pair_iat,
+             ctx_flow_pkts_10s, ctx_flow_iat, ctx_src_new_dports_10s]
 
 train_defaults:
   model: xgboost
@@ -73,3 +79,15 @@ experiments:                    # run in this order
   rf_portable: {model: random_forest, feature_set: portable}
   xgb_portable_fine: {model: xgboost, feature_set: portable, label_scheme: fine,
                       xgboost: {n_estimators: 300}}   # 17 classes: every round builds 17 trees
+  xgb_strict: {model: xgboost, feature_set: strict}
+  # the third Mirai run (episode 2 of every Mirai label) is left out of training and early stopping;
+  # step 4 tests whether the model still recognises that run
+  xgb_portable_mirai_holdout: {model: xgboost, feature_set: portable,
+                               holdout: {label_regex: "^Mirai", episode: 2}}
+
+evaluate:                       # step 4 (python -m gids evaluate)
+  models: [xgb_portable, xgb_full, lgbm_portable, xgb_strict, xgb_portable_fine]   # scored on the test split
+  main: xgb_portable            # detailed tables and explanations
+  holdout_experiment: xgb_portable_mirai_holdout   # trained without the third Mirai run ...
+  holdout_compare: xgb_portable                    # ... compared with the model that saw its first 60 %
+  shap_rows_per_class: 2000     # test packets per class used for the TreeSHAP explanations

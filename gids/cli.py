@@ -18,7 +18,7 @@ from .config import load_config
 from .state import (Deadline, GracefulStop, LockHeld, RunLock, ensure_dir, install_signal_handlers, read_json)
 from .trace import Tracer, list_manifests, read_events
 
-WRITE_CMDS = {"inventory", "explore", "ingest", "prepare", "train"}
+WRITE_CMDS = {"inventory", "explore", "ingest", "prepare", "train", "evaluate"}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -46,6 +46,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--max-minutes", type=float, help="stop cleanly after this many minutes")
     s = sub.add_parser("train", help="build the dataset, train every experiment, compare on validation (resumable)")
     s.add_argument("--only", help="comma-separated experiment names (default: all enabled, in order)")
+    s.add_argument("--max-minutes", type=float, help="stop cleanly after this many minutes")
+    s = sub.add_parser("evaluate", help="test split, unseen Mirai run, per device type, TreeSHAP (resumable)")
     s.add_argument("--max-minutes", type=float, help="stop cleanly after this many minutes")
     sub.add_parser("status", help="progress of every stage and recent runs")
     s = sub.add_parser("trace", help="show recent log events")
@@ -173,6 +175,14 @@ def print_status(cfg) -> None:
             print("train: not run yet")
     except Exception as exc:  # noqa: BLE001 - status must never fail
         print(f"train: (status unavailable: {exc})")
+    ev = work / "reports" / "evaluate"
+    if ev.exists():
+        parts = sorted(p.stem for p in ev.glob("*.json"))
+        print(f"evaluate: {', '.join(parts) or 'nothing finished yet'}")
+        if (ev / "EVALUATE.md").exists():
+            print(f"  report: {ev / 'EVALUATE.md'}")
+    else:
+        print("evaluate: not run yet")
     runs = list_manifests(work)[-8:]
     if runs:
         print("recent runs:")
@@ -274,6 +284,10 @@ def main(argv=None) -> int:
             from .train import run_train
 
             run_train(cfg, tracer, deadline, only=[x.strip() for x in args.only.split(",")] if args.only else None)
+        elif args.cmd == "evaluate":
+            from .evaluate import run_evaluate
+
+            run_evaluate(cfg, tracer, deadline)
     except GracefulStop as exc:
         status, code = "stopped", 3
         print(f"\nStopped ({exc}). Progress is saved - run the same command again to continue.")
