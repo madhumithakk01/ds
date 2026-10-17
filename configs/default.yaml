@@ -26,13 +26,31 @@ explore:
 
 ingest:
   label_column: auto          # auto-detected; set the column name if detection is wrong
+  block_mb: 32                # bytes of CSV text parsed at a time (does not change the results)
+  part_mb: 128                # a checkpoint + Parquet part is written after this much CSV text
+  drop_columns: [eth_src, eth_dst, ip_checksum, tcp_checksum, ip_tos]   # identifiers / always empty
+  context_features: true      # ctx_* features from earlier packets of the same capture
+  ctx_short_s: 1.0            # short look-back window
+  ctx_long_s: 10.0            # long look-back window (and cap for inter-arrival times)
+  max_carry_rows: 2000000     # most packets kept as look-back history between blocks
+  segment_backstep_s: 1.0     # time going back by more than this starts a new capture segment
+  max_gap_s: 300              # a pause longer than this also starts one
+
+split:                        # see gids/split.py; changing these does not re-run ingest
+  fractions: [0.6, 0.1, 0.3]  # train, validation, test - in time order inside every block
+  block_h: 1.0                # episodes are cut into blocks of at most this many hours
+  episode_gap_s: 600          # a pause longer than this between packets of a label starts a new episode
+  gap_frac: 0.01              # packets left out between parts: this share of the block duration ...
+  gap_min_s: 1.0              # ... but at least this many seconds
+  gap_max_share: 0.05         # ... and never more than this share of the block's packets
+  min_block_packets: 200      # smaller blocks are merged into a neighbour
 
 labels:
   scheme: coarse              # coarse: six families; fine: every raw label is a class
   normal_class: Normal
   unmapped: keep              # keep unknown raw labels as their own class, or drop them
   explicit_map: {}            # "raw label": "class" (checked before the rules)
-  drop_raw: []
+  drop_raw: [Unknown]         # raw labels left out of training and evaluation
   rules:                      # regex (case-insensitive) -> class, first match wins
     - ["normal|benign", "Normal"]
     - ["brute", "Brute Force"]

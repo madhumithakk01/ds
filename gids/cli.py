@@ -18,7 +18,7 @@ from .config import load_config
 from .state import (Deadline, GracefulStop, LockHeld, RunLock, ensure_dir, install_signal_handlers, read_json)
 from .trace import Tracer, list_manifests, read_events
 
-WRITE_CMDS = {"inventory", "explore"}
+WRITE_CMDS = {"inventory", "explore", "ingest"}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -38,12 +38,15 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--refresh-inventory", action="store_true")
     s.add_argument("--max-minutes", type=float, help="stop cleanly after this many minutes")
     s.add_argument("--block-mb", type=float)
+    s = sub.add_parser("ingest", help="CSV -> Parquet parts with context features, then the split (resumable)")
+    s.add_argument("--max-files", type=int, help="only the N smallest files (quick look)")
+    s.add_argument("--max-minutes", type=float, help="stop cleanly after this many minutes")
     sub.add_parser("status", help="progress of every stage and recent runs")
     s = sub.add_parser("trace", help="show recent log events")
     s.add_argument("--tail", type=int, default=40)
     s.add_argument("--errors", action="store_true", help="warnings and errors only")
     s.add_argument("--run", help="run id (default: latest)")
-    s = sub.add_parser("selftest", help="end-to-end check on a small synthetic archive (~30 s)")
+    s = sub.add_parser("selftest", help="end-to-end check on a small synthetic archive (~1 min)")
     s.add_argument("--keep", action="store_true")
     s = sub.add_parser("unlock", help="remove the work-directory lock")
     s.add_argument("--yes", action="store_true")
@@ -90,6 +93,31 @@ def print_status(cfg) -> None:
             print(f"         summary: {work / 'reports' / 'explore' / 'SUMMARY.md'}")
     else:
         print("explore: inventory not run yet")
+    from .layout import ingest_dir
+
+    led = ingest_dir(cfg) / "_ledger.jsonl"
+    if led.exists():
+        last = {}
+        for line in led.read_text().splitlines():
+            try:
+                r = json.loads(line)
+                last[r["unit"]] = r
+            except (json.JSONDecodeError, KeyError):
+                continue
+        done = [r for r in last.values() if r["status"] == "done"]
+        n_csv = len([m for m in inv["members"] if m["kind"] == "processed_csv"]) if inv else "?"
+        print(f"ingest: {len(done)}/{n_csv} files, {sum(int(r.get('rows', 0)) for r in done):,} rows "
+              f"({led.parent.name})")
+        partial = sorted((led.parent / "_state").glob("*.json")) if (led.parent / "_state").exists() else []
+        for f in partial:
+            st = read_json(f) or {}
+            if st.get("member") not in {r["unit"] for r in done}:
+                print(f"         in progress: {Path(st.get('member', '?')).name} - {len(st.get('parts', []))} "
+                      f"part(s), byte {st.get('offset', 0):,}")
+        if (work / "reports" / "ingest" / "INGEST.md").exists():
+            print(f"         report: {work / 'reports' / 'ingest' / 'INGEST.md'}")
+    else:
+        print("ingest: not run yet")
     runs = list_manifests(work)[-8:]
     if runs:
         print("recent runs:")
@@ -179,6 +207,10 @@ def main(argv=None) -> int:
 
             run_explore(cfg, tracer, deadline, max_files=args.max_files,
                         refresh_inventory=args.refresh_inventory)
+        elif args.cmd == "ingest":
+            from .ingest import run_ingest
+
+            run_ingest(cfg, tracer, deadline, max_files=args.max_files)
     except GracefulStop as exc:
         status, code = "stopped", 3
         print(f"\nStopped ({exc}). Progress is saved - run the same command again to continue.")

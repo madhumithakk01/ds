@@ -162,6 +162,31 @@ def make_archive(path, rows_per_device: int = 3000, seed: int = 0) -> Dict:
     return truth
 
 
+def _same_ingest(a: Path, b: Path, truth: Dict) -> Tuple[bool, str]:
+    """Compare the ingested rows of two work directories file by file."""
+    import pandas as pd
+
+    def load(work: Path) -> Dict[str, "pd.DataFrame"]:
+        d = next((work / "data").glob("ingest-*"))
+        out = {}
+        for f in d.glob("*.json"):
+            meta = json.loads(f.read_text())
+            if "parts" not in meta:
+                continue
+            df = pd.concat([pd.read_parquet(d / p) for p in meta["parts"]], ignore_index=True)
+            out[meta["member"]] = df.astype({c: str for c in df.columns if df[c].dtype.name == "category"})
+        return out
+
+    x, y = load(a), load(b)
+    if sorted(x) != sorted(y) or len(x) != len(truth["files"]):
+        return False, f"files {len(x)} vs {len(y)}"
+    for k in x:
+        if not x[k].equals(y[k]):
+            diff = [c for c in x[k].columns if c not in y[k] or not x[k][c].equals(y[k][c])]
+            return False, f"{k}: columns differ {diff[:5]}"
+    return True, ""
+
+
 def selftest(keep: bool = False) -> bool:
     repo = Path(__file__).resolve().parents[1]
     tmp = Path(tempfile.mkdtemp(prefix="gids_selftest_"))
@@ -205,8 +230,28 @@ def selftest(keep: bool = False) -> bool:
     sessions = {json.loads(x)["session"] for x in ledger if x.strip()}
     checks.append(("work split across two sessions", len(sessions) >= 2, f"{len(sessions)} sessions"))
     checks.append(("summary written", (work / "reports/explore/SUMMARY.md").exists(), ""))
+    ing = base + ["--set", "ingest.block_mb=0.05", "--set", "ingest.part_mb=0.2"]
+    r = subprocess.run(ing + ["ingest"], cwd=repo, env=dict(env, GIDS_CRASH_AFTER="ingest_part:5"),
+                       capture_output=True, text=True)
+    checks.append(("ingest: simulated crash in the middle of a file", r.returncode == 17,
+                   f"exit code {r.returncode} {r.stderr[-400:]}"))
+    r = subprocess.run(ing + ["ingest"], cwd=repo, env=env, capture_output=True, text=True)
+    checks.append(("ingest resumes and finishes", r.returncode == 0, r.stderr[-800:] or r.stdout[-400:]))
+    si = json.loads((work / "reports/ingest/summary.json").read_text()) if \
+        (work / "reports/ingest/summary.json").exists() else {}
+    checks.append(("ingest: row count exact", si.get("rows") == truth["rows"], f"{si.get('rows')} vs {truth['rows']}"))
+    checks.append(("ingest: rows equal to explore", si.get("rows_match_explore") is True, ""))
+    checks.append(("split: every label in train, val and test", not any("has no packets" in c for c in
+                                                                         si.get("checks", ["?has no packets"])),
+                   str(si.get("checks"))))
+    ref = tmp / "work_ref"
+    r = subprocess.run([a if a != str(work) else str(ref) for a in base]
+                       + ["--set", "ingest.block_mb=0.3", "--set", "ingest.part_mb=1", "ingest"],
+                       cwd=repo, env=env, capture_output=True, text=True)
+    same, why = _same_ingest(work, ref, truth) if r.returncode == 0 else (False, r.stderr[-600:])
+    checks.append(("ingest: resumed output identical to an uninterrupted run with other block sizes", same, why))
     r = run(["status"])
-    checks.append(("status command", r.returncode == 0, r.stderr[-300:]))
+    checks.append(("status command", r.returncode == 0 and "ingest:" in r.stdout, r.stderr[-300:]))
     ok = all(c[1] for c in checks)
     for name, passed, detail in checks:
         print(f"  [{'PASS' if passed else 'FAIL'}] {name}" + ("" if passed else f"  -> {detail}"))

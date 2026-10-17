@@ -14,8 +14,8 @@ built to run on the free tier of Google Colab:
 
 | Step | What it does | State |
 |---|---|---|
-| 0. Explore | list the archive, profile every CSV, label/time/protocol/duplicate analysis | **ready** |
-| 1. Ingest | CSV -> typed Parquet parts with stream features | after reviewing step 0 |
+| 0. Explore | list the archive, profile every CSV, label/time/protocol/duplicate analysis | done |
+| 1. Ingest | CSV -> typed Parquet parts with context features; time-blocked train/val/test split | **ready** |
 | 2. Profile + compact | EDA, de-duplication with counts, leakage-free split | after step 1 |
 | 3. Train | imbalance-aware XGBoost / Random Forest with checkpoints | after step 2 |
 | 4. Evaluate + explain | per-class metrics, confusion, SHAP, dashboard tables | after step 3 |
@@ -33,15 +33,39 @@ built to run on the free tier of Google Colab:
    finished files are skipped and only the interrupted one is read again.
 5. Copy the text printed by cell 7 (`SUMMARY.md`) to plan the next steps.
 
+## Run step 1 in Colab
+
+1. Open <https://colab.research.google.com/github/madhumithakk01/ds/blob/main/notebooks/01_ingest.ipynb>
+2. CPU runtime, same `ZIP_PATH` / `WORK_DIR` as step 0, run all cells (about 30-60 min, ~1 GB on Drive).
+3. After a disconnect run cells 2 and 4 again: it continues from the last checkpoint.
+4. Copy the text printed by cell 6 (`INGEST.md`) into the chat.
+
+What step 1 decides (agreed after step 0):
+
+* **Classes:** six coarse classes (Normal, DoS, Network Scanning, Brute Force, C&C Communication,
+  Infection); the raw label `Unknown` is left out (`labels.drop_raw`). The 17 raw labels stay in the
+  data for a finer second evaluation.
+* **Split:** per raw label, in time order. Each attack episode (and benign traffic) is cut into
+  blocks of at most 1 h; in every block the first 60 % of packets are train, the next 10 % validation,
+  the last 30 % test, with a short gap left out in between. A random split would put near-identical
+  packets of the same flood into train and test; a plain early/late split would leave whole attack
+  types out of one side. Details: `gids/split.py`.
+* **Unit:** one prediction per packet, with context features (`ctx_*`) that only look *back* in time
+  within the same capture: packets/bytes per source, destination, IP pair and 5-tuple flow in the last
+  1 s / 10 s, inter-arrival times, new destination ports per source. IPs, MACs, device and time are
+  kept for analysis but are not features.
+
 ## Commands
 
 ```
 python -m gids env                 # hardware, disk, GPU, library versions, zip found?
-python -m gids selftest            # end-to-end check on a small synthetic archive
+python -m gids selftest            # end-to-end check on a small synthetic archive (crash + resume included)
 python -m gids inventory           # archive listing, CSV headers, first rows, read speed
 python -m gids explore             # full scan of every CSV (resumable) -> SUMMARY.md
 python -m gids explore --max-files 5        # quick look at the five smallest files
 python -m gids explore --max-minutes 60     # stop cleanly after an hour
+python -m gids ingest              # step 1: CSV -> Parquet + context features, then the split (resumable)
+python -m gids ingest --max-files 5         # quick look at the five smallest files
 python -m gids status              # progress, lock, recent runs (finished / killed)
 python -m gids trace --errors      # warnings and errors with tracebacks
 python -m gids unlock --yes        # remove a lock left by a dead session
@@ -69,7 +93,13 @@ reports/explore/
   shared_vectors_*_pairs.csv         which labels share identical packets
   metadata/                          copies of the archive's metadata JSON files
   *.png                              charts
+reports/ingest/
+  INGEST.md, summary.json            split per class / raw label, features, files, things to check
+  split_by_label.csv, split_by_class.csv, split_blocks.csv, split_episodes.csv
+  features.csv, files.csv            feature ranges and fill rates; per-file rows, parts, device IP
 data/explore/                        per-file scan results + progress ledger
+data/ingest-<hash>/                  Parquet parts (one or more per CSV), per-file metadata,
+                                     split-<hash>.json, _state/ checkpoints of half-done files
 logs/<run>.jsonl, logs/<run>.log     every event of every run
 runs/<run>/manifest.json             command, config, code commit, environment, final status
 state/                               lock, heartbeat, error tracebacks
@@ -77,7 +107,7 @@ state/                               lock, heartbeat, error tracebacks
 
 ## How resuming works
 
-Each unit of work (here: one CSV file) is recorded in an append-only ledger
+Each unit of work (one CSV file; inside a file, every 128 MB of ingested text) is recorded in an append-only ledger
 only after its results are safely written; files are written to a temporary
 name and renamed into place.  On restart, units whose results exist are
 skipped.  Because Google Drive can lose the last writes of a VM that dies,
@@ -87,7 +117,8 @@ time; a lock from a dead session is taken over automatically after 5 minutes.
 
 ## Configuration
 
-Defaults are in `configs/default.yaml`.  To change settings without editing
+Defaults are in `configs/default.yaml`.  Output folders are named after a hash of the settings
+that shaped them (`data/ingest-<hash>`), so changing a setting never mixes old and new results.  To change settings without editing
 the repository, create `config.override.yaml` in the work directory on Drive,
 or pass `--set` on the command line.
 

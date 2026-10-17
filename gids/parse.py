@@ -140,6 +140,34 @@ _TIME_FORMATS = (
 )
 
 
+_TSHARK_FMT = "%b %d, %Y %H:%M:%S.%f"
+
+
+def _tshark_time(s: pd.Series) -> Optional[np.ndarray]:
+    """Fast path for tshark's ``Dec  5, 2024 14:05:12.154175758 GMT`` (pyarrow string kernels).
+
+    The fraction is cut to microseconds exactly as the general path does, so
+    both give identical values; anything unexpected returns None and the
+    general path is used instead.
+    """
+    try:
+        import pyarrow as pa
+        import pyarrow.compute as pc
+
+        arr = pa.array(_as_str_series(s).to_numpy(dtype=object), type=pa.string())
+        arr = pc.utf8_trim_whitespace(arr)
+        arr = pc.if_else(pc.greater_equal(pc.find_substring(arr, "."), 0), arr, pa.scalar(None, pa.string()))
+        parts = pc.split_pattern(arr, ".", max_splits=1)
+        head = pc.replace_substring_regex(pc.list_element(parts, 0), r"\s+", " ")
+        ts = pc.strptime(head, format="%b %d, %Y %H:%M:%S", unit="s", error_is_null=True)
+        sec = pc.cast(ts, pa.int64()).to_numpy(zero_copy_only=False).astype(np.float64)
+        digits = pc.utf8_rpad(pc.utf8_slice_codeunits(pc.list_element(parts, 1), 0, 6), 6, "0")
+        us = pc.cast(digits, pa.float64()).to_numpy(zero_copy_only=False)
+    except Exception:  # noqa: BLE001
+        return None
+    return sec + us / 1e6
+
+
 def parse_time(s: pd.Series, hint: Optional[str] = None) -> Tuple[np.ndarray, int, str]:
     """Parse arrival times into epoch seconds (float64).
 
@@ -172,6 +200,8 @@ def parse_time(s: pd.Series, hint: Optional[str] = None) -> Tuple[np.ndarray, in
                 med = np.nanmedian(vals)
                 if not (1e8 < med < 5e9):
                     vals = np.full(n, np.nan)
+        elif m == f"fmt:{_TSHARK_FMT}" and (fast := _tshark_time(s)) is not None and _score(fast) >= 0.995:
+            vals = fast
         else:
             if cleaned is None:
                 cleaned = s.str.strip().str.replace(r"\s+", " ", regex=True)

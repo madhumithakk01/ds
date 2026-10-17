@@ -13,7 +13,7 @@ from typing import Any, Dict
 from .config import experiment_config, get_path
 from .state import ensure_dir, stable_hash
 
-INGEST_VERSION = 1
+INGEST_VERSION = 2
 FEATURIZE_VERSION = 1
 
 
@@ -40,7 +40,9 @@ def ingest_spec(cfg) -> Dict[str, Any]:
         "label_column": ing.get("label_column", "auto"),
         "drop_columns": sorted(ing.get("drop_columns", [])),
         "context": bool(ing.get("context_features", True)),
-        "window_s": float(ing.get("pps_window_s", 1.0)),
+        "ctx_short_s": float(ing.get("ctx_short_s", 1.0)),
+        "ctx_long_s": float(ing.get("ctx_long_s", 10.0)),
+        "max_carry_rows": int(ing.get("max_carry_rows", 2_000_000)),
         "max_gap_s": float(ing.get("max_gap_s", 300.0)),
         "backstep_s": float(ing.get("segment_backstep_s", 1.0)),
     }
