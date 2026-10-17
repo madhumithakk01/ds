@@ -5,7 +5,7 @@
 
 paths:
   work_dir: /content/drive/MyDrive/gotham_ids     # every output and all progress state lives here
-  zip_path: /content/drive/MyDrive/GothamDataset2025.zip
+  zip_path: /content/drive/MyDrive/Ds/GothamDataset2025.zip   # Ds = shortcut to the shared folder
   data_dir: null              # set instead of zip_path if the CSVs are already extracted somewhere
   search_roots: [/content/drive/MyDrive]          # searched when zip_path does not exist
   local_tmp: /content/gids_tmp

@@ -25,8 +25,10 @@ built to run on the free tier of Google Colab:
 1. Open the notebook:
    <https://colab.research.google.com/github/madhumithakk01/ds/blob/main/notebooks/00_explore_dataset.ipynb>
 2. Runtime -> Change runtime type -> **CPU** (keep GPU time for training).
-3. In cell 1 set `ZIP_PATH` if `GothamDataset2025.zip` is not in the root of My Drive.
-   If the zip is in "Shared with me", add a shortcut to My Drive first.
+3. The dataset is expected at `MyDrive/Ds/GothamDataset2025.zip` (`Ds` is a shortcut to the
+   shared folder: in "Shared with me", right-click it -> Organize -> Add shortcut -> My Drive).
+   If the file name differs, cell 2 lists the folder; set `ZIP_PATH` in cell 1 to match.
+   Outputs go to `MyDrive/gotham_ids`, in your own Drive, not in the shared folder.
 4. Run all cells. If Colab disconnects, reconnect and run them again:
    finished files are skipped and only the interrupted one is read again.
 5. Copy the text printed by cell 7 (`SUMMARY.md`) to plan the next steps.
