@@ -18,7 +18,7 @@ from .config import load_config
 from .state import (Deadline, GracefulStop, LockHeld, RunLock, ensure_dir, install_signal_handlers, read_json)
 from .trace import Tracer, list_manifests, read_events
 
-WRITE_CMDS = {"inventory", "explore", "ingest"}
+WRITE_CMDS = {"inventory", "explore", "ingest", "prepare"}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -39,6 +39,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--max-minutes", type=float, help="stop cleanly after this many minutes")
     s.add_argument("--block-mb", type=float)
     s = sub.add_parser("ingest", help="CSV -> Parquet parts with context features, then the split (resumable)")
+    s.add_argument("--max-files", type=int, help="only the N smallest files (quick look)")
+    s.add_argument("--max-minutes", type=float, help="stop cleanly after this many minutes")
+    s = sub.add_parser("prepare", help="labels, split, per-segment direction, merged rows, checks (resumable)")
     s.add_argument("--max-files", type=int, help="only the N smallest files (quick look)")
     s.add_argument("--max-minutes", type=float, help="stop cleanly after this many minutes")
     sub.add_parser("status", help="progress of every stage and recent runs")
@@ -118,6 +121,24 @@ def print_status(cfg) -> None:
             print(f"         report: {work / 'reports' / 'ingest' / 'INGEST.md'}")
     else:
         print("ingest: not run yet")
+    from .prepare import prepare_dir
+
+    led = prepare_dir(cfg) / "_ledger.jsonl"
+    if led.exists():
+        last = {}
+        for line in led.read_text().splitlines():
+            try:
+                r = json.loads(line)
+                last[r["unit"]] = r
+            except (json.JSONDecodeError, KeyError):
+                continue
+        done = [r for r in last.values() if r["status"] == "done"]
+        print(f"prepare: {len(done)} files, {sum(int(r.get('unique', 0)) for r in done):,} unique rows "
+              f"({led.parent.name})")
+        if (work / "reports" / "prepare" / "PREPARE.md").exists():
+            print(f"         report: {work / 'reports' / 'prepare' / 'PREPARE.md'}")
+    else:
+        print("prepare: not run yet")
     runs = list_manifests(work)[-8:]
     if runs:
         print("recent runs:")
@@ -211,6 +232,10 @@ def main(argv=None) -> int:
             from .ingest import run_ingest
 
             run_ingest(cfg, tracer, deadline, max_files=args.max_files)
+        elif args.cmd == "prepare":
+            from .prepare import run_prepare
+
+            run_prepare(cfg, tracer, deadline, max_files=args.max_files)
     except GracefulStop as exc:
         status, code = "stopped", 3
         print(f"\nStopped ({exc}). Progress is saved - run the same command again to continue.")

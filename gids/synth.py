@@ -30,6 +30,7 @@ DEVICES = [("air-quality", 1, "mqtt"), ("building-monitor", 2, "mqtt"), ("city-p
 ATTACKS = ["Network Scanning", "Telnet Brute Forcing", "Reporting", "Ingress Tool Transfer",
            "Remote Code Execution", "Periodic C&C Communication", "Remote Command Execution", "DoS Attack"]
 T0 = 1733407512.0
+STITCHED_IP = "10.0.1.251"  # cooler-motor-2's attack segment comes from this (other) device
 
 
 def _ts(t: float) -> str:
@@ -93,7 +94,9 @@ def _row(rng, t, kind, dev_ip, label) -> List[str]:
     return [r[h] for h in HEADER]
 
 
-def _device_csv(dev: str, proto: str, n: int, rng, malformed: int = 0) -> Tuple[str, Counter]:
+def _device_csv(dev: str, proto: str, n: int, rng, malformed: int = 0,
+                stitched_ip: str = "") -> Tuple[str, Counter]:
+    """One device's CSV; with ``stitched_ip`` the attack capture belongs to another device (two captures joined)."""
     dev_ip = f"10.0.1.{int(rng.integers(2, 250))}"
     rows, labels = [], Counter()
     n_benign = int(n * 0.6)
@@ -102,6 +105,7 @@ def _device_csv(dev: str, proto: str, n: int, rng, malformed: int = 0) -> Tuple[
         t += float(rng.exponential(0.5))
         rows.append(_row(rng, t, proto, dev_ip, "Normal"))
     t = T0 - 3600.0  # attack capture recorded earlier -> time jumps back at the join
+    dev_ip = stitched_ip or dev_ip
     phases = ATTACKS + (["CoAP Amplification Attack"] if proto == "coap" else [])
     per = max(1, (n - n_benign) // (len(phases) * 2))
     for ph in phases:
@@ -148,7 +152,8 @@ def make_archive(path, rows_per_device: int = 3000, seed: int = 0) -> Dict:
                 zf.writestr(f"{root}/raw/malicious/mirai-dos/iotsim-{dev}.pcap", rng.bytes(2048))
                 n = int(rows_per_device * (3 if proto == "rtsp" else 1))
                 bad = 2 if first else 0
-                text, labels = _device_csv(dev, proto, n, rng, malformed=bad)
+                text, labels = _device_csv(dev, proto, n, rng, malformed=bad,
+                                           stitched_ip=STITCHED_IP if dev == "cooler-motor-2" else "")
                 if first:
                     text = text.rstrip("\n")  # last line without a newline
                 first = False
@@ -184,6 +189,28 @@ def _same_ingest(a: Path, b: Path, truth: Dict) -> Tuple[bool, str]:
         if not x[k].equals(y[k]):
             diff = [c for c in x[k].columns if c not in y[k] or not x[k][c].equals(y[k][c])]
             return False, f"{k}: columns differ {diff[:5]}"
+    return True, ""
+
+
+def _read_csv(path: Path):
+    import pandas as pd
+
+    return pd.read_csv(path) if path.exists() else pd.DataFrame()
+
+
+def _same_prepare(a: Path, b: Path) -> Tuple[bool, str]:
+    import pandas as pd
+
+    def load(work: Path):
+        d = next((work / "data").glob("prepare-*")) / "rows"
+        return {f.name: pd.read_parquet(f) for f in sorted(d.glob("*.parquet"))}
+
+    x, y = load(a), load(b)
+    if sorted(x) != sorted(y) or not x:
+        return False, f"files {len(x)} vs {len(y)}"
+    for k in x:
+        if not x[k].equals(y[k]):
+            return False, f"{k} differs"
     return True, ""
 
 
@@ -250,8 +277,26 @@ def selftest(keep: bool = False) -> bool:
                        cwd=repo, env=env, capture_output=True, text=True)
     same, why = _same_ingest(work, ref, truth) if r.returncode == 0 else (False, r.stderr[-600:])
     checks.append(("ingest: resumed output identical to an uninterrupted run with other block sizes", same, why))
+    r = subprocess.run(base + ["prepare"], cwd=repo, env=dict(env, GIDS_CRASH_AFTER="prepare:3"),
+                       capture_output=True, text=True)
+    checks.append(("prepare: simulated crash after 3 files", r.returncode == 17, f"exit code {r.returncode}"))
+    r = subprocess.run(base + ["prepare"], cwd=repo, env=env, capture_output=True, text=True)
+    checks.append(("prepare resumes and finishes", r.returncode == 0, r.stderr[-800:] or r.stdout[-400:]))
+    sp = json.loads((work / "reports/prepare/summary.json").read_text()) if \
+        (work / "reports/prepare/summary.json").exists() else {}
+    checks.append(("prepare: packets per label and split equal to step 1", sp.get("accounting_ok") is True,
+                   str(sp.get("checks"))))
+    segs = _read_csv(work / "reports/prepare/segments.csv")
+    st = segs[segs["file"] == "iotsim-cooler-motor-2.csv"] if len(segs) else segs
+    checks.append(("prepare: joined captures get one device IP per segment",
+                   len(st) >= 2 and STITCHED_IP in set(st["device_ip"]) and st["device_ip"].nunique() == 2
+                   and bool((segs["share"] > 0.99).all()), st.to_string()[:600] if len(st) else "no segments"))
+    r = subprocess.run([a if a != str(work) else str(ref) for a in base] + ["prepare"], cwd=repo, env=env,
+                       capture_output=True, text=True)
+    same, why = _same_prepare(work, ref) if r.returncode == 0 else (False, r.stderr[-600:])
+    checks.append(("prepare: resumed output identical to an uninterrupted run", same, why))
     r = run(["status"])
-    checks.append(("status command", r.returncode == 0 and "ingest:" in r.stdout, r.stderr[-300:]))
+    checks.append(("status command", r.returncode == 0 and "prepare:" in r.stdout, r.stderr[-300:]))
     ok = all(c[1] for c in checks)
     for name, passed, detail in checks:
         print(f"  [{'PASS' if passed else 'FAIL'}] {name}" + ("" if passed else f"  -> {detail}"))

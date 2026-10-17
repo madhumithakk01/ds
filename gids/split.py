@@ -105,10 +105,15 @@ def make_split(labels: np.ndarray, t: np.ndarray, spec: Dict[str, Any]) -> pd.Da
     return pd.DataFrame(rows)
 
 
-def assign(labels, t: np.ndarray, table: pd.DataFrame) -> np.ndarray:
-    """Split code per packet: 0 train, 1 val, 2 test, 3 gap, -1 label not in the table."""
+def assign(labels, t: np.ndarray, table: pd.DataFrame, with_episode: bool = False):
+    """Split code per packet: 0 train, 1 val, 2 test, 3 gap, -1 label not in the table.
+
+    With ``with_episode`` also returns the episode number of every packet
+    (the n-th separate run of its label; -1 when not in the table).
+    """
     t = np.asarray(t, dtype=np.float64)
     out = np.full(len(t), NONE, dtype=np.int8)
+    episode = np.full(len(t), -1, dtype=np.int16)
     lab = pd.Series(labels).astype("category")
     codes = lab.cat.codes.to_numpy()
     for ci, name in enumerate(lab.cat.categories):
@@ -126,4 +131,5 @@ def assign(labels, t: np.ndarray, table: pd.DataFrame) -> np.ndarray:
         s[tt < col["train_end"]] = TRAIN
         s[~np.isfinite(tt)] = NONE
         out[m] = s
-    return out
+        episode[m] = tab["episode"].to_numpy()[b]
+    return (out, episode) if with_episode else out

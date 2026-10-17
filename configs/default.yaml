@@ -36,6 +36,11 @@ ingest:
   segment_backstep_s: 1.0     # time going back by more than this starts a new capture segment
   max_gap_s: 300              # a pause longer than this also starts one
 
+prepare:
+  drop_features: [inner_header]   # always 0 in this dataset
+  sample_per_class: 100000    # unique rows per class and split used for the checks in PREPARE.md
+  shortcut_depth: 3           # depth of the one-feature trees in the shortcut check
+
 split:                        # see gids/split.py; changing these does not re-run ingest
   fractions: [0.6, 0.1, 0.3]  # train, validation, test - in time order inside every block
   block_h: 1.0                # episodes are cut into blocks of at most this many hours
