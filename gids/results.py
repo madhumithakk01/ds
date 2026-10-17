@@ -312,9 +312,13 @@ def results_markdown(cfg, ex, ing, prep, ds, tmeta, tests, main, results, merged
     i, j = np.unravel_index(np.argmax(off), off.shape)
     err_share = 100 * off[i, j] / max(off.sum(), 1)
     strong = [c for c, p in pc.items() if p["f1"] is not None and p["f1"] == p["f1"] and p["f1"] >= 0.99]
-    L += [f"- **Data:** {ex.get('rows', 0):,} labelled packets from {ex.get('files_scanned', 0)} device captures "
-          f"({ex.get('devices', '?')} emulated IoT devices, {ex.get('device_types', '?')} device types) of the Gotham "
-          f"Dataset 2025; {len(mc['classes'])} classes after mapping {len(ex.get('labels', {}))} raw labels.",
+    raw = list(ex.get("labels", {}))
+    mapper_drop = set((cfg.get("labels", {}) or {}).get("drop_raw", []) or [])
+    used = [r for r in raw if r not in mapper_drop]
+    L += [f"- **Data:** {ex.get('rows', 0):,} labelled packets in {ex.get('files_scanned', 0)} capture files "
+          f"({ex.get('device_types', '?')} device types) of the Gotham Dataset 2025; {len(used)} of {len(raw)} raw "
+          f"labels used" + (f" ({', '.join(f'`{r}`' for r in raw if r in mapper_drop)} left out)" if
+                            len(used) < len(raw) else "") + f", grouped into {len(mc['classes'])} classes.",
           f"- **Main model** (`{main}`, {mt['model']} on {len(get_path(cfg, 'features.sets.' + mt['feature_set']))} "
           f"features, set `{mt['feature_set']}`): test macro-F1 **{mc['macro_f1']:.4f}**; benign packets flagged as "
           f"attacks: **{mc['benign_flagged_per_million']:.1f} per million**; attack packets let through as benign: "
