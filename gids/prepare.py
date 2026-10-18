@@ -47,8 +47,13 @@ def feature_columns(cfg) -> List[str]:
 
 
 def prepare_spec(cfg) -> Dict[str, Any]:
-    return {"v": PREPARE_VERSION, "ingest": stable_hash(layout.ingest_spec(cfg)), "split": split_name(cfg),
+    spec = {"v": PREPARE_VERSION, "ingest": stable_hash(layout.ingest_spec(cfg)), "split": split_name(cfg),
             "labels": cfg.get("labels", {}), "features": feature_columns(cfg)}
+    if layout.corrections_enabled(cfg):  # only then, so the original folder's fingerprint is unchanged
+        from .relabel import corrections_spec
+
+        spec["corrections"] = stable_hash(corrections_spec(cfg))
+    return spec
 
 
 def prepare_dir(cfg) -> Path:
@@ -69,6 +74,10 @@ def ingest_inputs(cfg) -> Tuple[Path, List[Dict[str, Any]], pd.DataFrame]:
     metas = sorted([m for m in metas if m], key=lambda m: m["id"])
     if not metas:
         raise RuntimeError(f"No ingested files in {ing}. Run `python -m gids ingest` first.")
+    if layout.corrections_enabled(cfg):
+        from .relabel import Corrections
+
+        return ing, metas, Corrections(cfg).table
     sfile = ing / f"{split_name(cfg)}.json"
     sp = read_json(sfile)
     if not sp:
@@ -147,7 +156,7 @@ def _dedupe(X: np.ndarray, keys: np.ndarray, w: np.ndarray, h: np.ndarray):
 
 
 def prepare_member(meta: Dict[str, Any], ing: Path, table: pd.DataFrame, voc: Dict[str, Any], feats: List[str],
-                   deadline: Deadline) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
+                   deadline: Deadline, fix=None) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
     segs = segment_table(ing, meta)
     seg_ip = dict(zip(segs["seg"], segs["device_ip"]))
     lab_index = {l: i for i, l in enumerate(voc["labels"])}
@@ -162,6 +171,8 @@ def prepare_member(meta: Dict[str, Any], ing: Path, table: pd.DataFrame, voc: Di
             continue
         if not len(df) or "label_raw" not in df:
             continue
+        if fix is not None:  # corrected labels (step 6); copied captures become "Duplicate copy" and are dropped
+            df = fix.apply(meta, p, df)
         rows_in += len(df)
         ip = df["seg"].map(seg_ip).astype(object).to_numpy()
         df["dir_out"] = (df["ip_src"].astype(object).to_numpy() == ip).astype(np.float32)
@@ -207,6 +218,11 @@ def run_prepare(cfg, tracer, deadline: Deadline, max_files: Optional[int] = None
     rdir = ensure_dir(out / "rows")
     voc = vocab(cfg, table)
     feats = feature_columns(cfg)
+    fix = None
+    if layout.corrections_enabled(cfg):
+        from .relabel import Corrections
+
+        fix = Corrections(cfg)
     atomic_write_json(out / "_spec.json", prepare_spec(cfg))
     atomic_write_json(out / "vocab.json", {**voc, "features": feats, "splits": list(SPLITS[:3])})
     ledger = Ledger(out / "_ledger.jsonl")
@@ -227,7 +243,7 @@ def run_prepare(cfg, tracer, deadline: Deadline, max_files: Optional[int] = None
         ledger.append(m["id"], "start")
         t0 = time.time()
         try:
-            rows, segs, info = retry(lambda: prepare_member(m, ing, table, voc, feats, deadline), tries=3,
+            rows, segs, info = retry(lambda: prepare_member(m, ing, table, voc, feats, deadline, fix), tries=3,
                                      base_delay=10.0, on_error=lambda a, e: tracer.warn(
                                          STAGE, "io_retry", f"attempt {a}: {e}", member=m["member"]))
         except (GracefulStop, KeyboardInterrupt):

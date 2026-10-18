@@ -20,7 +20,19 @@ def work(cfg) -> Path:
     return ensure_dir(get_path(cfg, "paths.work_dir"))
 
 
+def corrections_enabled(cfg) -> bool:
+    """True when the behaviour-consistent label set of step 6 is used instead of the original labels."""
+    return bool(get_path(cfg, "corrections.enabled", False))
+
+
 def reports(cfg, *sub) -> Path:
+    """Report folder; results on corrected labels go to reports_corrected so they never overwrite the originals."""
+    base = "reports_corrected" if corrections_enabled(cfg) else "reports"
+    return ensure_dir(work(cfg).joinpath(base, *sub))
+
+
+def base_reports(cfg, *sub) -> Path:
+    """Reports that do not depend on the labels (explore, ingest, audit): always under reports/."""
     return ensure_dir(work(cfg).joinpath("reports", *sub))
 
 
@@ -69,7 +81,7 @@ def experiment_spec(cfg, name: str) -> Dict[str, Any]:
     exp = experiment_config(cfg, name)
     exp_clean = {k: v for k, v in exp.items() if k not in ("enabled", "notes", "name")}
     model = exp_clean.get("model", "xgboost")
-    exp_clean = {k: v for k, v in exp_clean.items() if not isinstance(v, dict) or k == model}
+    exp_clean = {k: v for k, v in exp_clean.items() if not isinstance(v, dict) or k in (model, "holdout")}
     return {"exp": exp_clean, "dataset": stable_hash(dataset_spec(cfg)),
             "features": get_path(cfg, f"features.sets.{exp.get('feature_set', 'full')}")}
 

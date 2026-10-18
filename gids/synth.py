@@ -30,6 +30,11 @@ DEVICES = [("air-quality", 1, "mqtt"), ("building-monitor", 2, "mqtt"), ("city-p
 ATTACKS = ["Network Scanning", "Telnet Brute Forcing", "Reporting", "Ingress Tool Transfer",
            "Remote Code Execution", "Periodic C&C Communication", "Remote Command Execution", "DoS Attack"]
 T0 = 1733407512.0
+# Gotham-like Mirai infection traffic (hosts as in the dataset's labelling metadata)
+ATTACKER, BOT, MASSCAN, OTHER = "192.168.0.100", "192.168.17.50", "192.168.35.10", "10.9.9.9"
+ATTACKER_PROBE_PORT, BOT_PROBE_PORT = 65148, 41000
+INFECTION = {"attacker_probes": 40, "attacker_sessions": 25, "bot_sessions": 20, "bot_probes": 60,
+             "masscan_probes": 150, "other_unknown": 8, "session_rounds": 3}
 STITCHED_IP = "10.0.1.251"  # cooler-motor-2's attack segment comes from this (other) device
 
 
@@ -92,6 +97,102 @@ def _row(rng, t, kind, dev_ip, label) -> List[str]:
         r["ip.proto"] = "1,17"
         r["frame.protocols"] = "eth:ethertype:ip:icmp:ip:udp:dns"
     return [r[h] for h in HEADER]
+
+
+def _tcp(rng, t, src, dst, sport, dport, flags, label, flen, opts="", win="502", sf="128", app=""):
+    r = {h: "" for h in HEADER}
+    r["frame.time"] = _ts(t)
+    r["eth.src"], r["eth.dst"] = "02:42:0a:00:01:05", "02:42:0a:00:01:01"
+    r["ip.flags"], r["ip.ttl"], r["ip.proto"], r["ip.tos"] = "0x02", "64", "6", "0x00"
+    r["ip.checksum"] = f"0x{rng.integers(0, 65535):04x}"
+    r["ip.src"], r["ip.dst"] = src, dst
+    r["tcp.srcport"], r["tcp.dstport"] = str(sport), str(dport)
+    r["tcp.flags"] = f"0x{flags:04x}"
+    r["tcp.window_size_value"], r["tcp.window_size_scalefactor"] = win, sf
+    r["tcp.checksum"] = f"0x{rng.integers(0, 65535):04x}"
+    r["tcp.options"] = opts
+    r["frame.len"] = str(flen)
+    r["frame.protocols"] = "eth:ethertype:ip:tcp" + (f":{app}" if app else "")
+    r["label"] = label
+    return [r[h] for h in HEADER]
+
+
+def _session(rng, t, client, cport, server, label, rounds):
+    """A telnet login connection: handshake, data both ways, close. Returns (rows, end time)."""
+    syn_opts = "020405b40402080a" + f"{rng.integers(0, 2**32):08x}" + "0000000001030307"
+    ts_opts = lambda: "0101080a" + f"{rng.integers(0, 2**32):08x}{rng.integers(0, 2**32):08x}"  # noqa: E731
+    rows = [_tcp(rng, t, client, server, cport, 23, 0x002, label, 74, syn_opts, "64240", "-1"),
+            _tcp(rng, t + 0.001, server, client, 23, cport, 0x012, label, 74, syn_opts, "65160", "-1"),
+            _tcp(rng, t + 0.002, client, server, cport, 23, 0x010, label, 66, ts_opts())]
+    t += 0.003
+    for _ in range(rounds):
+        pl = int(rng.integers(8, 40))
+        rows += [_tcp(rng, t, server, client, 23, cport, 0x018, label, 66 + pl, ts_opts(), app="telnet"),
+                 _tcp(rng, t + 0.001, client, server, cport, 23, 0x010, label, 66, ts_opts()),
+                 _tcp(rng, t + 0.002, client, server, cport, 23, 0x018, label, 66 + pl, ts_opts(), app="telnet"),
+                 _tcp(rng, t + 0.003, server, client, 23, cport, 0x010, label, 66, ts_opts())]
+        t += 0.004
+    rows += [_tcp(rng, t, client, server, cport, 23, 0x011, label, 66, ts_opts()),
+             _tcp(rng, t + 0.001, server, client, 23, cport, 0x011, label, 66, ts_opts())]
+    return rows, t + 0.002
+
+
+def _probe(rng, t, scanner, sport, target, dport, label, answer=0x012, close=True):
+    """A raw SYN probe (no TCP options), the target's answer and, optionally, the scanner's RST."""
+    rows = [_tcp(rng, t, scanner, target, sport, dport, 0x002, label, 60, win=str(int(rng.integers(1, 65535))),
+                 sf="-1"),
+            _tcp(rng, t + 0.001, target, scanner, dport, sport, answer, label, 60, sf="-1")]
+    if close:
+        rows.append(_tcp(rng, t + 0.002, scanner, target, sport, dport, 0x004, label, 60, sf="-1"))
+    return rows
+
+
+def _infected_csv(rng, n_benign: int) -> Tuple[str, Counter, Dict[str, int]]:
+    """A device attacked as in the dataset's Mirai infection phase, plus masscan packets left 'Unknown'."""
+    dev_ip = "192.168.18.10"
+    events = []  # (time, rows)
+    t = T0
+    for _ in range(n_benign):
+        t += float(rng.exponential(1.3))
+        events.append((t, [_row(rng, t, "mqtt", dev_ip, "Benign")]))
+    inf = INFECTION
+    t = T0 + 1200.0
+    order = (["ap"] * inf["attacker_probes"] + ["as"] * inf["attacker_sessions"] + ["bs"] * inf["bot_sessions"]
+             + ["bp"] * inf["bot_probes"])
+    for kind in rng.permutation(order):
+        t += float(rng.exponential(0.2))
+        if kind == "ap":
+            events.append((t, _probe(rng, t, ATTACKER, ATTACKER_PROBE_PORT, dev_ip, 23, "TCP Scan")))
+        elif kind == "bp":
+            events.append((t, _probe(rng, t, BOT, BOT_PROBE_PORT, dev_ip, 23, "TCP Scan")))
+        else:
+            client, label = (ATTACKER, "Telnet Brute Force") if kind == "as" else (BOT, "TCP Scan")
+            rows, t_end = _session(rng, t, client, int(rng.integers(40000, 60000)), dev_ip, label,
+                                   inf["session_rounds"])
+            events.append((t, rows))
+            t = t_end
+    t = T0 + 2400.0
+    for _ in range(inf["masscan_probes"]):
+        t += float(rng.exponential(0.1))
+        events.append((t, _probe(rng, t, MASSCAN, 61000, dev_ip, int(rng.integers(1, 1024)), "Unknown",
+                                 answer=0x014, close=False)))
+    for _ in range(inf["other_unknown"]):
+        t += 0.05
+        events.append((t, [_tcp(rng, t, OTHER, dev_ip, 5555, 8080, 0x002, "Unknown", 60, sf="-1")]))
+    events.sort(key=lambda e: e[0])
+    buf = io.StringIO()
+    w = csv.writer(buf, lineterminator="\n")
+    w.writerow(HEADER)
+    labels: Counter = Counter()
+    for _, rows in events:
+        for r in rows:
+            w.writerow(r)
+            labels[r[-1]] += 1
+    s = 3 + 4 * inf["session_rounds"] + 2
+    expect = {"tcp_scan": 3 * inf["attacker_probes"] + s * inf["bot_sessions"] + 3 * inf["bot_probes"],
+              "bot_sessions": s * inf["bot_sessions"], "brute_force": s * inf["attacker_sessions"],
+              "unknown": 2 * inf["masscan_probes"] + inf["other_unknown"], "masscan": 2 * inf["masscan_probes"]}
+    return buf.getvalue(), labels, expect
 
 
 def _device_csv(dev: str, proto: str, n: int, rng, malformed: int = 0,
@@ -163,6 +264,24 @@ def make_archive(path, rows_per_device: int = 3000, seed: int = 0) -> Dict:
                 truth["labels"].update(labels)
                 truth["rows"] += rows
                 truth["bad_lines"] += bad
+        # a device attacked as in the Mirai infection phase (+ masscan packets the dataset left 'Unknown')
+        text, labels, expect = _infected_csv(rng, rows_per_device)
+        zf.writestr(f"{root}/processed/iotsim-domotic-monitor-1.csv", text)
+        truth["files"]["iotsim-domotic-monitor-1.csv"] = {"rows": sum(labels.values()), "labels": dict(labels)}
+        truth["labels"].update(labels)
+        truth["rows"] += sum(labels.values())
+        truth["audit"] = expect
+        # the prefix-glob bug: device -10's capture copied into device -1's file
+        t10, l10 = _device_csv("hydraulic-system-10", "mqtt", rows_per_device // 3, rng)
+        t1, l1 = _device_csv("hydraulic-system-1", "mqtt", rows_per_device // 3, rng)
+        copy_rows = t10.split("\n", 1)[1]
+        for name, text, labels in (("hydraulic-system-10", t10, l10),
+                                   ("hydraulic-system-1", t1.rstrip("\n") + "\n" + copy_rows, l1 + l10)):
+            zf.writestr(f"{root}/processed/iotsim-{name}.csv", text)
+            truth["files"][f"iotsim-{name}.csv"] = {"rows": sum(labels.values()), "labels": dict(labels)}
+            truth["labels"].update(labels)
+            truth["rows"] += sum(labels.values())
+        truth["audit"]["duplicate"] = sum(l10.values())
     truth["labels"] = dict(truth["labels"])
     return truth
 
@@ -370,8 +489,67 @@ def selftest(keep: bool = False) -> bool:
     figs = sorted(p.name for p in (res / "figures").glob("*.png")) if (res / "figures").exists() else []
     checks.append(("results: RESULTS.md and 5 figures written", r.returncode == 0 and (res / "RESULTS.md").exists()
                    and len(figs) == 5, f"{figs} {r.stderr[-600:]}"))
+    # step 6: audit, corrected labels, paper
+    r = subprocess.run(base + ["audit"], cwd=repo, env=dict(env, GIDS_CRASH_AFTER="audit:3"), capture_output=True,
+                       text=True)
+    checks.append(("audit: simulated crash after 3 files", r.returncode == 17, f"exit code {r.returncode}"))
+    r = subprocess.run(base + ["audit"], cwd=repo, env=env, capture_output=True, text=True)
+    au = json.loads((work / "reports/audit/audit.json").read_text()) if \
+        (work / "reports/audit/audit.json").exists() else {}
+    want = truth["audit"]
+    got = {"tcp_scan": au.get("tcp_scan_packets"), "bot_sessions": au.get("tcp_scan_bot_telnet_sessions"),
+           "brute_force": au.get("brute_force_packets"), "unknown": (au.get("unknown") or {}).get("packets"),
+           "masscan": (au.get("unknown") or {}).get("masscan_packets"), "duplicate": au.get("duplicate_packets")}
+    checks.append(("audit resumes; infection labels, Unknown / masscan packets and copied captures counted exactly",
+                   r.returncode == 0 and got == want, f"{got} vs {want} {r.stderr[-400:]}"))
+    r = subprocess.run(base + ["--set", "corrections.enabled=true", "prepare"], cwd=repo, env=env, capture_output=True,
+                       text=True)
+    spc = json.loads((work / "reports_corrected/prepare/summary.json").read_text()) if \
+        (work / "reports_corrected/prepare/summary.json").exists() else {}
+    lab = _read_csv(work / "reports_corrected/ingest/split_by_label.csv")
+    tot = dict(zip(lab["label"], lab["total"])) if len(lab) else {}
+    fixed = {"TCP Scan": want["tcp_scan"] - want["bot_sessions"] + want["masscan"],
+             "Telnet Brute Force": want["brute_force"] + want["bot_sessions"]}
+    checks.append(("corrected labels: relabelled counts as generated, copies left out, prepare accounting exact",
+                   r.returncode == 0 and spc.get("accounting_ok") is True and "Duplicate copy" not in tot
+                   and all(tot.get(k) == v for k, v in fixed.items()), f"{tot} vs {fixed}; {r.stderr[-400:]}"))
+    pp = tr_args + ["--set", "ingest.block_mb=0.05", "--set", "ingest.part_mb=0.2",
+                    "--set", "paper.reference.max_rows_per_label=500", "--set", "paper.reference.xgboost.n_estimators=20",
+                    "--set", "paper.reference.ours_max_rows_per_class=3000", "--set", "paper.lodo_limit=2",
+                    "--set", "paper.seeds=[1]", "--set", "paper.bootstrap_rounds=200", "--set", "paper.efficiency_rows=2000",
+                    "--set", "train_defaults.mlp.epochs=3", "--set", "train_defaults.mlp.rows_per_epoch=20000"]
+    r = subprocess.run(base + pp + ["paper"], cwd=repo, env=dict(env, GIDS_CRASH_AFTER="reference_part:4"),
+                       capture_output=True, text=True)
+    checks.append(("paper: simulated crash while reading the CSVs again", r.returncode == 17,
+                   f"exit code {r.returncode} {r.stderr[-400:]}"))
+    r = subprocess.run(base + pp + ["paper"], cwd=repo, env=env, capture_output=True, text=True)
+    pap = work / "reports/paper"
+    txt = (pap / "PAPER.md").read_text() if (pap / "PAPER.md").exists() else ""
+    prog = json.loads((pap / "progress.json").read_text()) if (pap / "progress.json").exists() else {}
+    figs = sorted(p.name for p in (pap / "figures").glob("*.png")) if (pap / "figures").exists() else []
+    checks.append(("paper: every part finishes, PAPER.md has every section and 3 figures",
+                   r.returncode == 0 and len(prog) == 9 and all(v.get("status") == "done" for v in prog.values())
+                   and "Not run yet" not in txt and "No test predictions" not in txt and len(figs) == 3,
+                   f"{prog} {figs} {r.stderr[-600:]}"))
+    rows_json = sorted((work / "data").glob("reference-*/rows.json"))
+    seen = {d["label"]: d["packets"] for d in json.loads(rows_json[0].read_text())["labels"]} if rows_json else {}
+    checks.append(("paper: the reference pass reads every packet exactly once", seen == truth["labels"],
+                   f"{seen} vs {truth['labels']}"))
+    r = subprocess.run([a if a != str(work) else str(ref) for a in base] + pp
+                       + ["--set", "ingest.block_mb=0.3", "--set", "ingest.part_mb=1", "--set",
+                          "paper.reference.protocols=[P1]", "--set", "paper.reference.rf_protocols=[]",
+                          "paper", "--parts", "reference"], cwd=repo, env=env, capture_output=True, text=True)
+    same, why = False, r.stderr[-600:]
+    if r.returncode == 0 and rows_json:
+        import pandas as pd
+
+        a_rows = pd.read_parquet(rows_json[0].with_name("rows.parquet"))
+        b_rows = pd.read_parquet(ref / "data" / rows_json[0].parent.name / "rows.parquet")
+        same, why = a_rows.equals(b_rows), f"{len(a_rows)} vs {len(b_rows)} rows"
+    checks.append(("paper: sampled packets identical to an uninterrupted run with other block sizes", same, why))
     r = run(["status"])
-    checks.append(("status command", r.returncode == 0 and "xgb_full" in r.stdout, r.stderr[-300:]))
+    checks.append(("status command", r.returncode == 0 and "xgb_full" in r.stdout and "paper:" in r.stdout,
+                   r.stderr[-300:]))
     ok = all(c[1] for c in checks)
     for name, passed, detail in checks:
         print(f"  [{'PASS' if passed else 'FAIL'}] {name}" + ("" if passed else f"  -> {detail}"))

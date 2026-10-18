@@ -204,8 +204,8 @@ def run_results(cfg, tracer) -> Dict[str, Any]:
     work = layout.work(cfg)
     rep = layout.reports(cfg, "results")
     figs = ensure_dir(rep / "figures")
-    ex = read_json(layout.reports(cfg, "explore") / "summary.json") or {}
-    ing = read_json(layout.reports(cfg, "ingest") / "summary.json") or {}
+    ex = read_json(layout.base_reports(cfg, "explore") / "summary.json") or {}
+    ing = read_json(layout.base_reports(cfg, "ingest") / "summary.json") or {}
     prep = read_json(layout.reports(cfg, "prepare") / "summary.json") or {}
     ds = read_json(layout.dataset_dir(cfg) / "dataset.json") or {}
     tmeta = read_json(layout.dataset_dir(cfg) / "test.json") or {}

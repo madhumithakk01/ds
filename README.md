@@ -19,7 +19,8 @@ built to run on the free tier of Google Colab:
 | 2. Prepare | per-segment device IP, classes, split + episode tags, merged rows with weights, shortcut check | done |
 | 3. Train | XGBoost / LightGBM / random forest x feature sets (full, no TTL, portable), checkpoints, validation | done |
 | 4. Evaluate + explain | test split, false alarms, per device type, unseen Mirai run, TreeSHAP | done |
-| 5. Results | RESULTS.md + figures from the saved outputs; scan + brute force merged view | **ready** |
+| 5. Results | RESULTS.md + figures from the saved outputs; scan + brute force merged view | done |
+| 6. Paper | dataset audit, published protocol reproduced, corrected labels, intervals, ablations, unseen device types | **ready** |
 
 ## Run step 0 in Colab
 
@@ -92,6 +93,27 @@ options fields, which partly fingerprint the sender's operating system) and `xgb
 1. Open <https://colab.research.google.com/github/madhumithakk01/ds/blob/main/notebooks/05_results.ipynb>
 2. CPU runtime, run all cells (about a minute). Cell 6 downloads the document, figures and tables as a zip.
 
+## Run step 6 in Colab
+
+1. Open <https://colab.research.google.com/github/madhumithakk01/ds/blob/main/notebooks/06_paper.ipynb>
+2. Runtime -> Change runtime type -> **T4 GPU** if available, run cells 1, 2 and 4. After a disconnect run cells 1,
+   2 and 4 again; several sessions are expected. Cell 6 prints PAPER.md and the audit for the chat.
+
+| part | | what it measures |
+|---|---|---|
+| `audit` | E0 | copied captures (`glob(f"{device}*.csv")` in the authors' `data_preparation.py`), bots' telnet login sessions labelled *TCP Scan*, masscan packets left *Unknown*; the corrected label set |
+| `reference` | E1 | the published protocol on the same packets: the authors' 70 inputs (timestamp, TTL, checksums, ...) and our features, each with the random 60/20/20 split of the reference notebook and with our time-blocked split (P1-P9) |
+| `score` | E3 | test predictions of the step 3 models; cluster-bootstrap 95% intervals (device type x raw label x run) |
+| `corrected` | E2 | the main models prepared, trained and tested again on the corrected labels |
+| `ablation` | E4 | `header` (this packet's fields) vs `context` (earlier packets only) vs both (`portable`) |
+| `baselines` | E5 | logistic regression and the authors' 128-128-64 ReLU network on our features |
+| `efficiency` | E6 | model size, packets per second for features and prediction, ingest speed |
+| `lodo` | E7 | each attacked device type left out of training: attacks detected, false alarms |
+| `seeds` | E3 | four more training seeds of `xgb_portable` and `xgb_full` |
+
+`tools/check_reference.py` runs the authors' notebook functions and `gids/reference.py` on the same packets and lists
+every model input that differs (cell 8 of the notebook does this on a real CSV).
+
 ## Commands
 
 ```
@@ -108,6 +130,10 @@ python -m gids train               # step 3: dataset + every experiment in confi
 python -m gids train --only xgb_full,xgb_portable
 python -m gids evaluate            # step 4: test split, unseen Mirai run, per device type, TreeSHAP (resumable)
 python -m gids results             # step 5: RESULTS.md + figures from the saved outputs (re-runs nothing)
+python -m gids audit               # step 6, E0 only: dataset audit and corrected labels (resumable)
+python -m gids paper               # step 6: E0-E7 and PAPER.md (resumable)
+python -m gids paper --parts reference,score
+python -m gids --set corrections.enabled=true prepare   # any step on the corrected labels (-> reports_corrected/)
 python -m gids status              # progress, lock, recent runs (finished / killed)
 python -m gids trace --errors      # warnings and errors with tracebacks
 python -m gids unlock --yes        # remove a lock left by a dead session
@@ -148,6 +174,14 @@ reports/train/
 reports/results/
   RESULTS.md, figures/*.png          the write-up: summary, data, method, results, limitations, reproducibility
   test_results.csv, test_telnet_merged_f1.csv, results.json
+reports/audit/
+  AUDIT.md, audit.json               copied captures, Mirai infection labels by host and behaviour, Unknown packets,
+  duplicates.csv, infection_labels.csv, unknown_pairs.csv, transitions.csv     corrected labels
+reports/paper/
+  PAPER.md, figures/*.png            E0-E7 with published numbers, intervals and summary sentences
+  reference/<P>_<model>.json, reference.csv    E1 protocols
+  e2_corrected.csv, e3_test_ci.csv, ablation.csv, baselines.csv, efficiency.json, e7_lodo.csv, progress.json
+reports_corrected/                   steps 1-3 reports of the corrected labels (never overwrite reports/)
 reports/evaluate/
   EVALUATE.md, test_results.csv      test metrics of every model, unseen run, explanations
   test_<model>.json, unseen_run.json, explain.json, per_device_type_<model>.csv
@@ -159,7 +193,9 @@ data/prepare-<hash>/rows/            one Parquet table per CSV: features, split,
 data/dataset-<hash>/                 train.parquet / val.parquet sampled for training, dataset.json,
                                      test.parquet (every test row, read only by step 4)
 models/<experiment>-<hash>/          model.bin, state.json (checkpoint), metrics.json, per_class.csv,
-                                     confusion.csv, importance.csv
+                                     confusion.csv, importance.csv; test_pred.npy (step 6)
+data/relabel-<hash>/                 audit per file, corrected-label sidecars, corrected split
+data/reference-<hash>/               sampled packets with the authors' preprocessing (E1) + our features
 logs/<run>.jsonl, logs/<run>.log     every event of every run
 runs/<run>/manifest.json             command, config, code commit, environment, final status
 state/                               lock, heartbeat, error tracebacks
@@ -188,6 +224,7 @@ or pass `--set` on the command line.
 gids/            pipeline package (python -m gids ...)
 configs/         default settings
 notebooks/       Colab notebooks, one per step
+tools/           check_reference.py: gids/reference.py vs the authors' preprocessing, input by input
 ```
 
 ## Dataset

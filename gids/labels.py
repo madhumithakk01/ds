@@ -14,6 +14,9 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import pandas as pd
 
 
+DUPLICATE = "Duplicate copy"  # rows of another device's capture copied into a file (step 6 corrections)
+
+
 class LabelMapper:
     def __init__(self, cfg_labels: Dict):
         self.scheme = cfg_labels.get("scheme", "coarse")
@@ -31,6 +34,8 @@ class LabelMapper:
 
     def explain(self, raw: str) -> Tuple[Optional[str], str]:
         r = self._norm(raw)
+        if r == DUPLICATE:
+            return None, "copy of another device's capture (corrected labels)"
         if r in self.drop:
             return None, "dropped by labels.drop_raw"
         if self.scheme == "fine":

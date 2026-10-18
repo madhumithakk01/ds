@@ -63,3 +63,18 @@ labels:
     - ["amplif|\\bdos\\b|ddos|flood", "DoS"]
     - ["ingress|infect|download|code exec|loader", "Infection"]
     - ["c&c|c2|command|report|periodic|beacon", "C&C Communication"]
+
+# Step 6 (python -m gids audit / paper). Kept outside `labels` so that the original pipeline's
+# settings fingerprints - and the models already trained - stay unchanged.
+corrections:                  # behaviour-consistent label set, see gids/relabel.py
+  enabled: false              # false: original labels; true: corrected labels (results go to reports_corrected/)
+  telnet_by_behaviour: true   # TCP Scan / Telnet Brute Force on the telnet ports: a connection that carries data
+                              # -> Telnet Brute Force, probe-only connection -> TCP Scan, whichever host sent it
+  telnet_ports: [23, 2323]
+  masscan_ip: 192.168.35.10   # Unknown packets to/from the masscan host (metadata-masscan.json) -> TCP Scan
+  drop_duplicate_devices: true    # captures of other devices copied into a file (prefix-glob bug) are dropped
+
+audit:                        # facts from the dataset's labelling metadata used by the audit
+  mirai_attacker_ip: 192.168.0.100    # metadata-mirai-infection.json: the host whose traffic is "Telnet Brute Force"
+  mirai_probe_port: 65148     # its SYN probes from this source port are "TCP Scan"
+

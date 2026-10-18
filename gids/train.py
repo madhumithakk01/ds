@@ -38,7 +38,7 @@ from .explore import md_table
 from .ingest import _read_parquet, _to_parquet_bytes
 from .prepare import KEYS, _row_hash, prepare_dir
 from .state import (Deadline, GracefulStop, Ledger, atomic_copy, atomic_write_bytes, atomic_write_json,
-                    atomic_write_text, crash_point, output_ok, read_json, stable_hash)
+                    atomic_write_text, crash_point, ensure_dir, output_ok, read_json, stable_hash)
 
 STAGE = "train"
 # standard ports of the protocols in the testbed and of common IoT services -> service id (0 = none of these)
@@ -141,9 +141,12 @@ def cross_file_merge(h: np.ndarray, f: np.ndarray, w: np.ndarray, infos: List[Di
 
 
 def held_out_mask(df: pd.DataFrame, labels: List[str], hold: Optional[Dict[str, Any]]) -> np.ndarray:
-    """True for rows of a held-out run: raw label matching ``hold['label_regex']`` and episode ``hold['episode']``."""
+    """True for held-out rows: a whole device type (``hold['device_type']``), or a run of an attack (raw label
+    matching ``hold['label_regex']`` in episode ``hold['episode']``)."""
     if not hold or not len(df):
         return np.zeros(len(df), dtype=bool)
+    if "device_type" in hold:
+        return df["device_type"].astype(str).to_numpy() == str(hold["device_type"])
     rx = re.compile(hold["label_regex"])
     held = np.array([bool(rx.search(lab)) for lab in labels])
     return held[df["label"].to_numpy(np.int64)] & (df["episode"].to_numpy(np.int64) == int(hold["episode"]))
@@ -385,7 +388,137 @@ def fit_random_forest(p: Dict[str, Any], X, y, w, Xv, yv, wv, n_cls: int, mdir: 
     return predict, dict(zip(range(X.shape[1]), rf.feature_importances_.tolist()))
 
 
-FITTERS = {"xgboost": fit_xgboost, "lightgbm": fit_lightgbm, "random_forest": fit_random_forest}
+def _squash(X) -> np.ndarray:
+    """Inputs for the linear and neural baselines: empty -> -1 (as the reference preprocessing), then
+    sign(x) * log(1 + |x|), which tames the heavy-tailed counts and byte rates before standardising."""
+    X = np.nan_to_num(np.asarray(X, dtype=np.float32), nan=-1.0)
+    return np.sign(X) * np.log1p(np.abs(X))
+
+
+def _proba_full(model, X, n_cls: int) -> np.ndarray:
+    """predict_proba with a column for every class, also those absent from the training rows."""
+    full = np.zeros((len(X), n_cls))
+    if len(X):
+        full[:, model.classes_] = model.predict_proba(X)
+    return full
+
+
+def _val_logloss(P: np.ndarray, y: np.ndarray, w: np.ndarray) -> float:
+    return float(-np.average(np.log(np.clip(P[np.arange(len(y)), y], 1e-15, 1)), weights=w))
+
+
+def fit_logreg(p: Dict[str, Any], X, y, w, Xv, yv, wv, n_cls: int, mdir: Path, prog: _Progress):
+    import joblib
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.preprocessing import StandardScaler
+
+    if prog.state["iterations"] and output_ok(mdir / "model.bin"):
+        scaler, lr = joblib.load(mdir / "model.bin")
+    else:
+        import warnings
+
+        from sklearn.exceptions import ConvergenceWarning
+
+        scaler = StandardScaler().fit(_squash(X))
+        lr = LogisticRegression(C=float(p.get("C", 1.0)), max_iter=int(p.get("max_iter", 300)))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", ConvergenceWarning)
+            lr.fit(scaler.transform(_squash(X)), y, sample_weight=w)
+        if int(np.max(lr.n_iter_)) >= lr.max_iter:
+            prog.tracer.info(STAGE, "logreg", f"{prog.name}: stopped at max_iter={lr.max_iter} (not fully converged)")
+        prog.update(1, _val_logloss(_proba_full(lr, scaler.transform(_squash(Xv)), n_cls), yv, wv))
+        prog.save(lambda path: joblib.dump((scaler, lr), path, compress=3))
+    prog.state["best_iter"] = 1
+    imp = dict(zip(range(X.shape[1]), np.abs(lr.coef_).mean(axis=0).tolist()))
+    return (lambda Xp: _proba_full(lr, scaler.transform(_squash(Xp)), n_cls)), imp
+
+
+def fit_mlp(p: Dict[str, Any], X, y, w, Xv, yv, wv, n_cls: int, mdir: Path, prog: _Progress):
+    """Fully connected network (by default the dataset authors' 128-128-64 ReLU layout).
+
+    Every epoch is a fresh class-balanced sample of the training rows (drawn with the training weights,
+    seeded by epoch, so a resumed run continues exactly); the epoch with the lowest validation loss is kept.
+    """
+    import joblib
+    from sklearn.neural_network import MLPClassifier
+    from sklearn.preprocessing import StandardScaler
+
+    if prog.state["iterations"] and output_ok(mdir / "model.bin"):
+        scaler, mlp = joblib.load(mdir / "model.bin")
+        prog.tracer.info(STAGE, "resume", f"{prog.name}: continuing after epoch {prog.state['iterations']}")
+    else:
+        scaler = StandardScaler().fit(_squash(X))
+        mlp = MLPClassifier(hidden_layer_sizes=tuple(p.get("hidden", [128, 128, 64])), activation="relu",
+                            solver="adam", alpha=float(p.get("alpha", 1e-4)),
+                            learning_rate_init=float(p.get("learning_rate", 1e-3)),
+                            batch_size=int(p.get("batch_size", 1024)), random_state=int(p.get("seed", 0)))
+    Xs = scaler.transform(_squash(X)).astype(np.float32)
+    Xvs = scaler.transform(_squash(Xv)).astype(np.float32)
+    prob = np.asarray(w, dtype=np.float64) / np.sum(w)
+    per_epoch = int(min(p.get("rows_per_epoch", 500_000), max(len(y), 1)))
+    classes = np.arange(n_cls)
+    while prog.state["iterations"] < int(p.get("epochs", 30)):
+        e = prog.state["iterations"]
+        idx = np.random.default_rng([int(p.get("seed", 0)), e]).choice(len(y), size=per_epoch, p=prob)
+        for i in range(0, per_epoch, 100_000):
+            mlp.partial_fit(Xs[idx[i:i + 100_000]], y[idx[i:i + 100_000]], classes=classes)
+        stop = prog.update(e + 1, _val_logloss(_proba_full(mlp, Xvs, n_cls), yv, wv))
+        writer = lambda path: joblib.dump((scaler, mlp), path, compress=3)  # noqa: E731
+        if prog.state["best_iter"] == e + 1:
+            tmp = Path(tempfile.mkdtemp())
+            joblib.dump((scaler, mlp), tmp / "best", compress=3)
+            atomic_copy(tmp / "best", mdir / "best.bin")
+            shutil.rmtree(tmp, ignore_errors=True)
+        prog.save(writer)
+        prog.check_stop(writer)
+        if stop:
+            break
+    scaler_b, best = joblib.load(mdir / "best.bin")
+    imp = dict(zip(range(X.shape[1]), np.abs(best.coefs_[0]).sum(axis=1).tolist()))
+    return (lambda Xp: _proba_full(best, scaler_b.transform(_squash(Xp)), n_cls)), imp
+
+
+FITTERS = {"xgboost": fit_xgboost, "lightgbm": fit_lightgbm, "random_forest": fit_random_forest,
+           "logreg": fit_logreg, "mlp": fit_mlp}
+
+
+def raw_predictor(model: str, mdir: Path, best: int, n_cls: int):
+    """predict(X) -> class probabilities of a finished model saved in ``mdir``."""
+    import joblib
+
+    if model == "xgboost":
+        import xgboost as xgb
+
+        bst = xgb.Booster(model_file=str(mdir / "model.bin"))
+        bst.set_param({"device": "cpu"})
+        return bst, (lambda X: bst.inplace_predict(X, iteration_range=(0, best)))
+    if model == "lightgbm":
+        import lightgbm as lgb
+
+        bst = lgb.Booster(model_file=str(mdir / "model.bin"))
+        return bst, (lambda X: bst.predict(X, num_iteration=best))
+    if model in ("logreg", "mlp"):
+        scaler, m = joblib.load(mdir / ("best.bin" if model == "mlp" else "model.bin"))
+        return m, (lambda X: _proba_full(m, scaler.transform(_squash(X)), n_cls))
+    rf = joblib.load(mdir / "model.bin")
+    return rf, (lambda X: _proba_full(rf, np.nan_to_num(X, nan=-1.0), n_cls))
+
+
+def train_on_arrays(cfg, name: str, spec: Dict[str, Any], model: str, params: Dict[str, Any], X, y, w, Xv, yv, wv,
+                    n_cls: int, tracer, deadline: Deadline):
+    """Train (or reload) a model on ready arrays - used by the protocol experiments of step 6."""
+    mdir = ensure_dir(layout.work(cfg) / "models" / f"{name}-{stable_hash(spec)}")
+    atomic_write_json(mdir / "experiment.json", {"name": name, **spec})
+    st = read_json(mdir / "state.json") or {}
+    if st.get("status") == "done" and (output_ok(mdir / "model.bin")):
+        return raw_predictor(model, mdir, int(st["best_iter"]), n_cls)[1], mdir
+    prog = _Progress(mdir, int(params.get("early_stopping_rounds", 10**9)), int(params.get("checkpoint_every", 1)),
+                     deadline, tracer, name, int(params.get("n_estimators", params.get("epochs", 1))))
+    tracer.info(STAGE, "experiment", f"{name}: {model} on {len(y):,} rows, {X.shape[1]} features")
+    predict, _ = FITTERS[model](params, X, y, w, Xv, yv, wv, n_cls, mdir, prog)
+    prog.state["status"] = "done"
+    atomic_write_json(mdir / "state.json", prog.state)
+    return predict, mdir
 
 
 def load_model(cfg, name: str, ds: Dict[str, Any]) -> Dict[str, Any]:
@@ -400,26 +533,7 @@ def load_model(cfg, name: str, ds: Dict[str, Any]) -> Dict[str, Any]:
     classes, lut = label_space({k: ds[k] for k in ("classes", "labels", "label_class")},
                                exp.get("label_scheme", "coarse"))
     best = int(st["best_iter"])
-    if model == "xgboost":
-        import xgboost as xgb
-
-        bst = xgb.Booster(model_file=str(mdir / "model.bin"))
-        bst.set_param({"device": "cpu"})
-        raw = lambda X: bst.inplace_predict(X, iteration_range=(0, best))
-    elif model == "lightgbm":
-        import lightgbm as lgb
-
-        bst = lgb.Booster(model_file=str(mdir / "model.bin"))
-        raw = lambda X: bst.predict(X, num_iteration=best)
-    else:
-        import joblib
-
-        bst = joblib.load(mdir / "model.bin")
-
-        def raw(X):
-            full = np.zeros((len(X), len(classes)))
-            full[:, bst.classes_] = bst.predict_proba(np.nan_to_num(X, nan=-1.0))
-            return full
+    bst, raw = raw_predictor(model, mdir, best, len(classes))
 
     def predict(df: pd.DataFrame, chunk: int = 1_000_000) -> np.ndarray:
         return np.concatenate([np.asarray(raw(make_matrix(df.iloc[i:i + chunk], names)))
@@ -505,7 +619,7 @@ def run_experiment(cfg, name: str, ds: Dict[str, Any], tracer, deadline: Deadlin
     tracer.info(STAGE, "experiment", f"{name}: {model}, {len(names)} features ({fs}), {len(classes)} classes "
                 f"({scheme}); {len(y):,} training rows, {len(yv):,} validation rows")
     prog = _Progress(mdir, int(params.get("early_stopping_rounds", 10**9)), int(params.get("checkpoint_every", 1)),
-                     deadline, tracer, name, int(params.get("n_estimators", 1)))
+                     deadline, tracer, name, int(params.get("n_estimators", params.get("epochs", 1))))
     predict, imp = FITTERS[model](params, X, y, w, Xv, yv, wv_bal, len(classes), mdir, prog)
     proba = predict(Xv)
     pred = np.asarray(proba).argmax(axis=1)
@@ -536,10 +650,11 @@ def run_experiment(cfg, name: str, ds: Dict[str, Any], tracer, deadline: Deadlin
 
 def run_train(cfg, tracer, deadline: Deadline, only: Optional[List[str]] = None) -> Dict[str, Any]:
     ds = build_dataset(cfg, tracer, deadline)
-    names = [n for n in experiment_names(cfg) if not only or n in only]
-    unknown = [n for n in (only or []) if n not in experiment_names(cfg)]
+    known = list((cfg.get("experiments") or {}).keys())
+    names = list(dict.fromkeys(only)) if only else experiment_names(cfg)  # --only may name disabled experiments
+    unknown = [n for n in names if n not in known]
     if unknown:
-        raise KeyError(f"Unknown experiment(s) {unknown}. Known: {experiment_names(cfg)}")
+        raise KeyError(f"Unknown experiment(s) {unknown}. Known: {known}")
     cache: Dict[str, pd.DataFrame] = {}
     results = {}
     for n in names:

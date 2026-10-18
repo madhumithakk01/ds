@@ -52,9 +52,16 @@ def _disk(path) -> Optional[Dict[str, float]]:
         return None
 
 
+def _in_colab() -> bool:
+    try:
+        return importlib.util.find_spec("google.colab") is not None
+    except ModuleNotFoundError:  # no "google" package at all
+        return False
+
+
 def collect(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     info: Dict[str, Any] = {"python": sys.version.split()[0], "platform": platform.platform(),
-                            "cpus": os.cpu_count(), "colab": importlib.util.find_spec("google.colab") is not None}
+                            "cpus": os.cpu_count(), "colab": _in_colab()}
     try:
         import psutil
 

@@ -18,7 +18,7 @@ from .config import load_config
 from .state import (Deadline, GracefulStop, LockHeld, RunLock, ensure_dir, install_signal_handlers, read_json)
 from .trace import Tracer, list_manifests, read_events
 
-WRITE_CMDS = {"inventory", "explore", "ingest", "prepare", "train", "evaluate", "results"}
+WRITE_CMDS = {"inventory", "explore", "ingest", "prepare", "train", "evaluate", "results", "audit", "paper"}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -50,6 +50,12 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("evaluate", help="test split, unseen Mirai run, per device type, TreeSHAP (resumable)")
     s.add_argument("--max-minutes", type=float, help="stop cleanly after this many minutes")
     sub.add_parser("results", help="RESULTS.md and figures from the saved outputs of steps 0-4 (minutes)")
+    s = sub.add_parser("audit", help="step 6: dataset audit and corrected labels (resumable)")
+    s.add_argument("--max-minutes", type=float, help="stop cleanly after this many minutes")
+    s = sub.add_parser("paper", help="step 6: experiments E0-E7 and reports/paper/PAPER.md (resumable)")
+    s.add_argument("--parts", help="comma-separated parts (default: all, in order): audit, reference, score, "
+                                   "corrected, ablation, baselines, efficiency, lodo, seeds")
+    s.add_argument("--max-minutes", type=float, help="stop cleanly after this many minutes")
     sub.add_parser("status", help="progress of every stage and recent runs")
     s = sub.add_parser("trace", help="show recent log events")
     s.add_argument("--tail", type=int, default=40)
@@ -184,6 +190,11 @@ def print_status(cfg) -> None:
             print(f"  report: {ev / 'EVALUATE.md'}")
     else:
         print("evaluate: not run yet")
+    pp = read_json(work / "reports" / "paper" / "progress.json")
+    if pp:
+        print("paper: " + ", ".join(f"{k} {str(v.get('status', '?')).split(':')[0]}" for k, v in pp.items()))
+        if (work / "reports" / "paper" / "PAPER.md").exists():
+            print(f"  report: {work / 'reports' / 'paper' / 'PAPER.md'}")
     runs = list_manifests(work)[-8:]
     if runs:
         print("recent runs:")
@@ -293,6 +304,14 @@ def main(argv=None) -> int:
             from .results import run_results
 
             run_results(cfg, tracer)
+        elif args.cmd == "audit":
+            from .relabel import run_audit
+
+            run_audit(cfg, tracer, deadline)
+        elif args.cmd == "paper":
+            from .paper import run_paper
+
+            run_paper(cfg, tracer, deadline, parts=[x.strip() for x in args.parts.split(",")] if args.parts else None)
     except GracefulStop as exc:
         status, code = "stopped", 3
         print(f"\nStopped ({exc}). Progress is saved - run the same command again to continue.")

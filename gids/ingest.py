@@ -432,7 +432,7 @@ def _explore_rows(cfg) -> Dict[str, int]:
 
 
 def run_ingest(cfg, tracer, deadline: Deadline, max_files: Optional[int] = None) -> Dict[str, Any]:
-    inv = read_json(layout.reports(cfg, "explore") / "inventory.json")
+    inv = read_json(layout.base_reports(cfg, "explore") / "inventory.json")
     if not inv:
         tracer.info(STAGE, "inventory", "no inventory from step 0; listing the archive")
         inv = build_inventory(cfg)

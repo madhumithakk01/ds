@@ -33,6 +33,13 @@ features:
              tcp_pdu_size, proto_layers, proto_gre, dir_out, dir_in, ctx_all_pkts_1s, ctx_src_pkts_1s,
              ctx_src_pkts_10s, ctx_src_bytes_1s, ctx_dst_pkts_1s, ctx_pair_pkts_1s, ctx_pair_iat,
              ctx_flow_pkts_10s, ctx_flow_iat, ctx_src_new_dports_10s]
+    # step 6 ablation: the two halves of `portable`
+    header: [frame_len, ip_flags, ip_proto, sport_class, dport_class, sport_service, dport_service, tcp_flags,
+             tcp_window_size_value, tcp_window_size_scalefactor, tcp_pdu_size, tcp_options_len,
+             tcp_options_kinds, proto_layers, proto_gre, dir_out, dir_in]          # this packet only
+    context: [dir_out, dir_in, ctx_all_pkts_1s, ctx_src_pkts_1s, ctx_src_pkts_10s, ctx_src_bytes_1s,
+              ctx_dst_pkts_1s, ctx_pair_pkts_1s, ctx_pair_iat, ctx_flow_pkts_10s, ctx_flow_iat,
+              ctx_src_new_dports_10s]                                             # earlier packets only
 
 train_defaults:
   model: xgboost
@@ -69,6 +76,19 @@ train_defaults:
     max_samples: 0.1            # share of the training rows drawn for each tree
     batch: 10                   # trees between checkpoints
     seed: 0
+  logreg:                       # step 6 baseline: inputs sign(x)*log(1+|x|), standardised
+    C: 1.0
+    max_iter: 300
+  mlp:                          # step 6 baseline: the dataset authors' 128-128-64 ReLU network
+    hidden: [128, 128, 64]
+    learning_rate: 0.001
+    batch_size: 1024
+    alpha: 0.0001
+    epochs: 30
+    rows_per_epoch: 500000      # class-balanced rows drawn afresh for every epoch
+    early_stopping_rounds: 4    # epochs without a better validation loss
+    checkpoint_every: 1
+    seed: 0
 
 experiments:                    # run in this order
   xgb_full: {model: xgboost, feature_set: full}
@@ -84,6 +104,12 @@ experiments:                    # run in this order
   # step 4 tests whether the model still recognises that run
   xgb_portable_mirai_holdout: {model: xgboost, feature_set: portable,
                                holdout: {label_regex: "^Mirai", episode: 2}}
+  # step 6 (python -m gids paper): not run by `train`; seed and leave-one-device-type-out copies are added
+  # by the paper command itself
+  xgb_header: {model: xgboost, feature_set: header, enabled: false}
+  xgb_context: {model: xgboost, feature_set: context, enabled: false}
+  logreg_portable: {model: logreg, feature_set: portable, enabled: false}
+  mlp_portable: {model: mlp, feature_set: portable, enabled: false}
 
 evaluate:                       # step 4 (python -m gids evaluate)
   models: [xgb_portable, xgb_full, lgbm_portable, xgb_strict, xgb_portable_fine]   # scored on the test split
@@ -91,3 +117,25 @@ evaluate:                       # step 4 (python -m gids evaluate)
   holdout_experiment: xgb_portable_mirai_holdout   # trained without the third Mirai run ...
   holdout_compare: xgb_portable                    # ... compared with the model that saw its first 60 %
   shap_rows_per_class: 2000     # test packets per class used for the TreeSHAP explanations
+
+paper:                          # step 6 (python -m gids paper); every part is resumable and saved on Drive
+  main: xgb_portable            # the model the paper reports; the others are compared with it
+  compare: [xgb_full, xgb_no_ttl, xgb_strict, lgbm_portable, rf_portable]   # also scored with intervals
+  seeds: [1, 2, 3, 4]           # extra training seeds; seed 0 is the step 3 model
+  seed_models: [xgb_portable, xgb_full]
+  ablation: [xgb_header, xgb_context]
+  baselines: [logreg_portable, mlp_portable]
+  lodo_model: xgb_portable      # copies of this experiment are trained without one device type each ...
+  lodo_limit: 8                 # ... for the attacked device types with the most attack packets (0 = all)
+  corrected_models: [xgb_portable, xgb_full]   # trained again on the corrected labels (E2)
+  bootstrap_rounds: 1000        # cluster bootstrap: clusters = device type x raw label x run, per raw label
+  bootstrap_seed: 0
+  efficiency_rows: 200000       # test rows used to time prediction
+  reference:                    # E1: the published evaluation protocol, reproduced on the same packets
+    max_rows_per_label: 250000  # CSV packets sampled per raw label (each row keeps the packets it stands for)
+    ours_max_rows_per_class: 400000   # prepared unique rows sampled per class for our features
+    fractions: [0.6, 0.2, 0.2]  # random split of the reference notebook: train, validation, test
+    seed: 42                    # random_state of the reference notebook
+    protocols: [P1, P2, P3, P4, P5, P6, P7, P8, P9]
+    rf_protocols: [P1, P4]      # also trained as a random forest
+    xgboost: {n_estimators: 300, early_stopping_rounds: 20, checkpoint_every: 25}

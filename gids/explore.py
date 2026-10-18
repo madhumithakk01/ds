@@ -54,7 +54,7 @@ TEXT_COLS = IDENT_COLS | {"frame_protocols", "tcp_options"}
 # helpers
 
 def _out(cfg) -> Path:
-    return layout.reports(cfg, "explore")
+    return layout.base_reports(cfg, "explore")
 
 
 def _data(cfg) -> Path:
