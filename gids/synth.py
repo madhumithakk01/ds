@@ -36,6 +36,7 @@ ATTACKER_PROBE_PORT, BOT_PROBE_PORT = 65148, 41000
 INFECTION = {"attacker_probes": 40, "attacker_sessions": 25, "bot_sessions": 20, "bot_probes": 60,
              "masscan_probes": 150, "other_unknown": 8, "session_rounds": 3}
 STITCHED_IP = "10.0.1.251"  # cooler-motor-2's attack segment comes from this (other) device
+SECOND_RUN = "building-monitor-2"  # its attacks run three hours after everyone else's: a second run of each attack
 
 
 def _ts(t: float) -> str:
@@ -195,9 +196,10 @@ def _infected_csv(rng, n_benign: int) -> Tuple[str, Counter, Dict[str, int]]:
     return buf.getvalue(), labels, expect
 
 
-def _device_csv(dev: str, proto: str, n: int, rng, malformed: int = 0,
-                stitched_ip: str = "") -> Tuple[str, Counter]:
-    """One device's CSV; with ``stitched_ip`` the attack capture belongs to another device (two captures joined)."""
+def _device_csv(dev: str, proto: str, n: int, rng, malformed: int = 0, stitched_ip: str = "",
+                attack_t0: float = T0 - 3600.0) -> Tuple[str, Counter]:
+    """One device's CSV; with ``stitched_ip`` the attack capture belongs to another device (two captures joined).
+    ``attack_t0`` = start of the attack capture (a later start makes a second run of every attack)."""
     dev_ip = f"10.0.1.{int(rng.integers(2, 250))}"
     rows, labels = [], Counter()
     n_benign = int(n * 0.6)
@@ -205,7 +207,7 @@ def _device_csv(dev: str, proto: str, n: int, rng, malformed: int = 0,
     for _ in range(n_benign):
         t += float(rng.exponential(0.5))
         rows.append(_row(rng, t, proto, dev_ip, "Normal"))
-    t = T0 - 3600.0  # attack capture recorded earlier -> time jumps back at the join
+    t = attack_t0  # by default recorded earlier -> time jumps back at the join
     dev_ip = stitched_ip or dev_ip
     phases = ATTACKS + (["CoAP Amplification Attack"] if proto == "coap" else [])
     per = max(1, (n - n_benign) // (len(phases) * 2))
@@ -254,7 +256,8 @@ def make_archive(path, rows_per_device: int = 3000, seed: int = 0) -> Dict:
                 n = int(rows_per_device * (3 if proto == "rtsp" else 1))
                 bad = 2 if first else 0
                 text, labels = _device_csv(dev, proto, n, rng, malformed=bad,
-                                           stitched_ip=STITCHED_IP if dev == "cooler-motor-2" else "")
+                                           stitched_ip=STITCHED_IP if dev == "cooler-motor-2" else "",
+                                           attack_t0=T0 + 3 * 3600.0 if dev == SECOND_RUN else T0 - 3600.0)
                 if first:
                     text = text.rstrip("\n")  # last line without a newline
                 first = False
@@ -527,10 +530,21 @@ def selftest(keep: bool = False) -> bool:
     txt = (pap / "PAPER.md").read_text() if (pap / "PAPER.md").exists() else ""
     prog = json.loads((pap / "progress.json").read_text()) if (pap / "progress.json").exists() else {}
     figs = sorted(p.name for p in (pap / "figures").glob("*.png")) if (pap / "figures").exists() else []
+    from .paper import PARTS
+
     checks.append(("paper: every part finishes, PAPER.md has every section and 3 figures",
-                   r.returncode == 0 and len(prog) == 9 and all(v.get("status") == "done" for v in prog.values())
-                   and "Not run yet" not in txt and "No test predictions" not in txt and len(figs) == 3,
-                   f"{prog} {figs} {r.stderr[-600:]}"))
+                   r.returncode == 0 and len(prog) == len(PARTS) and all(v.get("status") == "done" for v in prog.values())
+                   and "Not run yet" not in txt and "No test predictions" not in txt and len(figs) == 3
+                   and (pap / "e2b_behaviour.csv").exists() and (pap / "e8_unseen_runs.csv").exists()
+                   and "## Headline findings" in txt, f"{prog} {figs} {r.stderr[-600:]}"))
+    beh = json.loads((pap / "e2b_behaviour.json").read_text()) if (pap / "e2b_behaviour.json").exists() else {}
+    groups = {(g["label_raw"], g["host"], g["kind"]): g["packets"] for g in beh.get("groups", [])}
+    runs = json.loads((pap / "unseen_runs.json").read_text()).get("runs", []) if \
+        (pap / "unseen_runs.json").exists() else []
+    checks.append(("paper: behaviour groups of the test packets and the second runs of the attacks found",
+                   groups.get(("TCP Scan", "other internal hosts", "telnet data connection"), 0) > 0
+                   and groups.get(("Telnet Brute Force", "Mirai attacker host", "telnet data connection"), 0) > 0
+                   and len(runs) >= 8 and all(r["episode"] == 1 for r in runs), f"{groups} {runs}"))
     rows_json = sorted((work / "data").glob("reference-*/rows.json"))
     seen = {d["label"]: d["packets"] for d in json.loads(rows_json[0].read_text())["labels"]} if rows_json else {}
     checks.append(("paper: the reference pass reads every packet exactly once", seen == truth["labels"],

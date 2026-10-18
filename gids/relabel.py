@@ -123,6 +123,35 @@ def _segment_ips(seg: np.ndarray, src: np.ndarray, dst: np.ndarray, ips: List[st
     return pd.DataFrame(rows)
 
 
+def telnet_behaviour(lab: np.ndarray, seg: np.ndarray, src: np.ndarray, dst: np.ndarray, proto: np.ndarray,
+                     sp: np.ndarray, dp: np.ndarray, flags: np.ndarray, flen: np.ndarray, optlen: np.ndarray,
+                     ports: np.ndarray, a_code: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Per packet: labelled TCP Scan / Telnet Brute Force; on a telnet port; in a telnet connection that carries
+    data; to or from the Mirai attacker host.
+
+    A connection = same capture segment, hosts and ports (IPs as integer codes); it carries data when any of its
+    packets has the PSH flag or bytes beyond the TCP/IP headers.
+    """
+    cand = np.isin(lab, CAND)
+    telnet = cand & (proto == 6) & (np.isin(sp, ports) | np.isin(dp, ports))
+    payload = ((flags & 8) > 0) | ((flen - 54 - optlen) > 6)   # PSH, or bytes beyond the TCP/IP headers
+    flow_data = np.zeros(len(lab), dtype=bool)
+    if telnet.any():
+        k = np.flatnonzero(telnet)
+        a, b = np.minimum(src[k], dst[k]), np.maximum(src[k], dst[k])
+        pa, pb = np.minimum(sp[k], dp[k]), np.maximum(sp[k], dp[k])
+        g = pd.DataFrame({"seg": seg[k], "a": a, "b": b, "pa": pa, "pb": pb, "pl": payload[k]})
+        flow_data[k] = g.groupby(["seg", "a", "b", "pa", "pb"])["pl"].transform("any").to_numpy(bool)
+    return cand, telnet, flow_data, (src == a_code) | (dst == a_code)
+
+
+def behaviour_names(telnet: np.ndarray, flow_data: np.ndarray, attacker: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    host = np.where(attacker, "Mirai attacker host", "other internal hosts")
+    kind = np.where(~telnet, "not telnet", np.where(flow_data, "telnet data connection",
+                                                    "telnet probe-only connection"))
+    return host, kind
+
+
 def relabel_member(meta: Dict[str, Any], ing: Path, out: Path, cfg) -> Dict[str, Any]:
     spec = corrections_spec(cfg)
     attacker = str(get_path(cfg, "audit.mirai_attacker_ip", "192.168.0.100"))
@@ -154,22 +183,12 @@ def relabel_member(meta: Dict[str, Any], ing: Path, out: Path, cfg) -> Dict[str,
     a_code = ip_code.get(attacker, -9)
 
     # --- Mirai infection labels: host x behaviour
-    cand = np.isin(lab, CAND)
     ports = np.array(spec["telnet_ports"], dtype=np.float64)
-    telnet = cand & (proto == 6) & (np.isin(sp, ports) | np.isin(dp, ports))
-    payload = ((flags & 8) > 0) | ((flen - 54 - optlen) > 6)   # PSH, or bytes beyond the TCP/IP headers
-    flow_data = np.zeros(n, dtype=bool)
-    if telnet.any():
-        k = np.flatnonzero(telnet)
-        a, b = np.minimum(src[k], dst[k]), np.maximum(src[k], dst[k])
-        pa, pb = np.minimum(sp[k], dp[k]), np.maximum(sp[k], dp[k])
-        g = pd.DataFrame({"seg": seg[k], "a": a, "b": b, "pa": pa, "pb": pb, "pl": payload[k]})
-        flow_data[k] = g.groupby(["seg", "a", "b", "pa", "pb"])["pl"].transform("any").to_numpy(bool)
+    cand, telnet, flow_data, attacker = telnet_behaviour(lab, seg, src, dst, proto, sp, dp, flags, flen, optlen, ports,
+                                                         a_code)
     if cand.any():
         k = np.flatnonzero(cand)
-        host = np.where((src[k] == a_code) | (dst[k] == a_code), "Mirai attacker host", "other internal hosts")
-        kind = np.where(~telnet[k], "not telnet", np.where(flow_data[k], "telnet data connection",
-                                                         "telnet probe-only connection"))
+        host, kind = behaviour_names(telnet[k], flow_data[k], attacker[k])
         probe = (sp[k] == probe_port) | (dp[k] == probe_port)
         c = pd.DataFrame({"seg": seg[k], "label": lab[k], "host": host, "kind": kind, "probe_port": probe})
         info["cand"] = c.groupby(["seg", "label", "host", "kind", "probe_port"]).size().reset_index(
@@ -449,6 +468,95 @@ def audit_markdown(cfg, s, dup_table, infection, top_pairs, top_ports, transitio
           "Corrected labels per split (time-blocked, as for the original labels):", "",
           md_table(by_label.reset_index(), max_rows=30), ""]
     return "\n".join(L) + "\n"
+
+
+def audit_infos(cfg) -> List[Dict[str, Any]]:
+    """The audit's per-file results (run `audit` first)."""
+    led = Ledger(relabel_dir(cfg) / "_ledger.jsonl").done()
+    infos = [read_json(r["info"]) for r in led.values() if output_ok(r.get("info", ""))]
+    if not infos:
+        raise RuntimeError("No audit results yet: run `python -m gids audit` (or `paper --parts audit`) first.")
+    return sorted(infos, key=lambda i: i["id"])
+
+
+def candidate_test_rows(cfg, tracer, deadline: Deadline, feats: List[str]) -> pd.DataFrame:
+    """Test packets labelled TCP Scan / Telnet Brute Force under the original labels and split (copied captures
+    left out), with the model inputs of step 2 and the host and behaviour group of the audit.
+
+    Used to see what models trained on the original labels predict for each behaviour (step 6, E2b). One
+    cached Parquet file per CSV, so an interrupted run continues with the next file.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from .prepare import prepare_spec
+    from .train import _prepare_infos
+
+    spec = corrections_spec(cfg)
+    infos = audit_infos(cfg)
+    dup, _ = duplicate_segments(infos)
+    _, pinfos, _ = _prepare_infos(cfg)
+    seg_ips = {i["id"]: {int(s["seg"]): s["device_ip"] for s in i.get("segments", [])} for i in pinfos}
+    ing = layout.ingest_dir(cfg)
+    sp = read_json(ing / f"{split_name(cfg)}.json")
+    if not sp:
+        raise RuntimeError("No split table from step 1 for the current split settings.")
+    table = pd.DataFrame(sp["blocks"])
+    cache = ensure_dir(relabel_dir(cfg) / f"behaviour-{stable_hash({'prepare': stable_hash(prepare_spec(cfg)), 'feats': feats})}")
+    attacker = str(get_path(cfg, "audit.mirai_attacker_ip", "192.168.0.100"))
+    ports = np.array(spec["telnet_ports"], dtype=np.float64)
+    cols = list(dict.fromkeys(NEEDED + feats))
+    todo = [i for i in infos if i.get("cand")]
+    frames = []
+    for k, info in enumerate(todo):
+        deadline.check()
+        path = cache / f"{stable_hash(info['id'], 16)}.parquet"
+        if output_ok(path):
+            frames.append(_read_parquet(path))
+            continue
+        parts = []
+        for p in info["parts"]:
+            pf = pq.ParquetFile(ing / p)
+            if "label_raw" not in pf.schema_arrow.names or not pf.metadata.num_rows:
+                continue
+            mask = pf.read(columns=["label_raw"]).to_pandas()["label_raw"].isin(CAND).to_numpy()
+            if not mask.any():
+                continue
+            present = [c for c in cols if c in pf.schema_arrow.names]
+            df = pf.read(columns=present).filter(pa.array(mask)).to_pandas()
+            for c in cols:
+                if c not in df:
+                    df[c] = np.nan
+            for c in ("ip_src", "ip_dst", "label_raw"):
+                df[c] = df[c].astype(str)
+            parts.append(df)
+        if not parts:
+            continue
+        df = pd.concat(parts, ignore_index=True)
+        ipcat = pd.Categorical(np.r_[df["ip_src"].to_numpy(), df["ip_dst"].to_numpy()])
+        codes = ipcat.codes.astype(np.int64)
+        n = len(df)
+        a_code = list(ipcat.categories).index(attacker) if attacker in set(ipcat.categories) else -9
+        lab = df["label_raw"].to_numpy(dtype=object)
+        _, telnet, flow_data, att = telnet_behaviour(
+            lab, df["seg"].to_numpy(np.int64), codes[:n], codes[n:], df["ip_proto"].to_numpy(np.float64),
+            df["tcp_srcport"].to_numpy(np.float64), df["tcp_dstport"].to_numpy(np.float64),
+            np.nan_to_num(df["tcp_flags"].to_numpy(np.float64)).astype(np.int64), df["frame_len"].to_numpy(np.float64),
+            np.nan_to_num(df["tcp_options_len"].to_numpy(np.float64)), ports, a_code)
+        host, kind = behaviour_names(telnet, flow_data, att)
+        split = assign(df["label_raw"], df["t"].to_numpy(np.float64), table)
+        keep = (split == 2) & ~df["seg"].isin(dup.get(info["id"], [])).to_numpy()
+        ip = df["seg"].map(seg_ips.get(info["id"], {})).astype(object).to_numpy()
+        df["dir_out"] = (df["ip_src"].to_numpy(dtype=object) == ip).astype(np.float32)
+        df["dir_in"] = (df["ip_dst"].to_numpy(dtype=object) == ip).astype(np.float32)
+        res = df.loc[keep, feats].astype(np.float32).reset_index(drop=True)
+        res["label_raw"], res["host"], res["kind"] = lab[keep], host[keep], kind[keep]
+        res["device_type"] = info["device_type"]
+        atomic_write_bytes(path, _to_parquet_bytes(res))
+        frames.append(res)
+        tracer.progress(STAGE, k + 1, len(todo), "files (behaviour groups of test packets)", every_s=30)
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=feats + ["label_raw", "host",
+                                                                                            "kind"])
 
 
 # =====================================================================

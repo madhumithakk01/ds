@@ -105,10 +105,12 @@ options fields, which partly fingerprint the sender's operating system) and `xgb
 | `reference` | E1 | the published protocol on the same packets: the authors' 70 inputs (timestamp, TTL, checksums, ...) and our features, each with the random 60/20/20 split of the reference notebook and with our time-blocked split (P1-P9) |
 | `score` | E3 | test predictions of the step 3 models; cluster-bootstrap 95% intervals (device type x raw label x run) |
 | `corrected` | E2 | the main models prepared, trained and tested again on the corrected labels |
+| `behaviour` | E2b | what the models trained on the original labels predict for bots' login sessions, scans and the attacker's sessions (not circular: the models never saw these groups) |
 | `ablation` | E4 | `header` (this packet's fields) vs `context` (earlier packets only) vs both (`portable`) |
 | `baselines` | E5 | logistic regression and the authors' 128-128-64 ReLU network on our features |
 | `efficiency` | E6 | model size, packets per second for features and prediction, ingest speed |
 | `lodo` | E7 | each attacked device type left out of training: attacks detected, false alarms |
+| `runs` | E8 | the last run of every repeated attack left out of training, then tested |
 | `seeds` | E3 | four more training seeds of `xgb_portable` and `xgb_full` |
 
 `tools/check_reference.py` runs the authors' notebook functions and `gids/reference.py` on the same packets and lists

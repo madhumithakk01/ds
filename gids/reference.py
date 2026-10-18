@@ -666,14 +666,19 @@ def protocol_spec_hash(cfg, P: str, model: str) -> str:
                         "params": _params(cfg, model), "classes": REF_CLASSES})
 
 
+def protocol_result(cfg, P: str, model: str) -> Optional[Dict[str, Any]]:
+    """Saved result of a protocol, only when it was computed with the current settings."""
+    m = read_json(_rep(cfg) / f"{P}_{MODEL_TAG[model]}.json")
+    return m if m and m.get("spec_hash") == protocol_spec_hash(cfg, P, model) else None
+
+
 def reference_table(cfg) -> pd.DataFrame:
     """Finished protocols of the current settings."""
-    current = {(P, MODEL_TAG[m]): protocol_spec_hash(cfg, P, m) for P in PROTOCOLS for m in MODEL_TAG}
     rows = []
     for P, (inputs, split, desc) in PROTOCOLS.items():
-        for tag in MODEL_TAG.values():
-            m = read_json(_rep(cfg) / f"{P}_{tag}.json")
-            if not m or m.get("spec_hash") != current.get((P, tag)):
+        for model, tag in MODEL_TAG.items():
+            m = protocol_result(cfg, P, model)
+            if not m:
                 continue
             row = {"protocol": P, "model": {"xgb": "XGBoost", "rf": "random forest"}[tag], "inputs": inputs,
                    "split": split, "macro_f1": m["macro_f1"], "balanced_acc": m["balanced_accuracy"]}

@@ -128,6 +128,7 @@ paper:                          # step 6 (python -m gids paper); every part is r
   lodo_model: xgb_portable      # copies of this experiment are trained without one device type each ...
   lodo_limit: 8                 # ... for the attacked device types with the most attack packets (0 = all)
   corrected_models: [xgb_portable, xgb_full]   # trained again on the corrected labels (E2)
+  behaviour_models: [xgb_portable, xgb_no_ttl, xgb_full]   # E2b: their predictions per behaviour group
   bootstrap_rounds: 1000        # cluster bootstrap: clusters = device type x raw label x run, per raw label
   bootstrap_seed: 0
   efficiency_rows: 200000       # test rows used to time prediction
@@ -139,3 +140,5 @@ paper:                          # step 6 (python -m gids paper); every part is r
     protocols: [P1, P2, P3, P4, P5, P6, P7, P8, P9]
     rf_protocols: [P1, P4]      # also trained as a random forest
     xgboost: {n_estimators: 300, early_stopping_rounds: 20, checkpoint_every: 25}
+    # close to scikit-learn's defaults, as in the published random forest: full-depth trees, leaves of one row
+    random_forest: {n_estimators: 50, max_depth: null, min_samples_leaf: 1, max_samples: 0.5, batch: 25}

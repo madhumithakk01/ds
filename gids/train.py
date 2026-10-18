@@ -141,12 +141,17 @@ def cross_file_merge(h: np.ndarray, f: np.ndarray, w: np.ndarray, infos: List[Di
 
 
 def held_out_mask(df: pd.DataFrame, labels: List[str], hold: Optional[Dict[str, Any]]) -> np.ndarray:
-    """True for held-out rows: a whole device type (``hold['device_type']``), or a run of an attack (raw label
-    matching ``hold['label_regex']`` in episode ``hold['episode']``)."""
+    """True for held-out rows: a whole device type (``hold['device_type']``), whole runs (``hold['runs']`` =
+    [[raw label, episode], ...]), or a run of an attack (raw label matching ``hold['label_regex']`` in episode
+    ``hold['episode']``)."""
     if not hold or not len(df):
         return np.zeros(len(df), dtype=bool)
     if "device_type" in hold:
         return df["device_type"].astype(str).to_numpy() == str(hold["device_type"])
+    if "runs" in hold:
+        index = {lab: i for i, lab in enumerate(labels)}
+        keys = [index[lab] * 100_000 + int(ep) for lab, ep in hold["runs"] if lab in index]
+        return np.isin(df["label"].to_numpy(np.int64) * 100_000 + df["episode"].to_numpy(np.int64), keys)
     rx = re.compile(hold["label_regex"])
     held = np.array([bool(rx.search(lab)) for lab in labels])
     return held[df["label"].to_numpy(np.int64)] & (df["episode"].to_numpy(np.int64) == int(hold["episode"]))
